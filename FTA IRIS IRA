@@ -1,0 +1,1385 @@
+/*+ETLM {
+    depend:{
+        replace:[
+            {name:"andes.nova_ddl.warehouse_attributes"},
+            {name:"andes.booker.O_MS_MARKETPLACES"},
+            {name:"andes.intl_fin_ddl.mp_finance"},
+            {name:"andes.booker.D_MP_LEGAL_ENTITY_MAP"},
+            {name:"andes.BDT_ANALYTICS_PROD.legal_entity_timezone_map"},
+            {name:"andes.FO_INSIGHTS.FC_TO_ZIP_DISTANCE"},
+      
+        ]
+    }
+}*/
+
+
+CREATE TEMP TABLE FC_MAPPING AS 
+ 
+    SELECT wa.warehouse_id                     as FC
+         , wa.warehouse_reporting_type
+         , wa.location_postal                     fc_zip
+         , wa.legal_entity_id
+         , SUBSTRING(wa.location_postal, 1, 5) AS fc_zip5
+         , SUBSTRING(wa.location_postal, 1, 3) AS fc_zip3
+         , nvl(FC.assigned_region, RM.region)  AS FC_Region
+        --  , FC.fc_type                          AS FC_Type
+         , FC.assigned_region                  AS FC_Assigned_region
+         , wa.fulfillment_node_type            AS fulfillment_node_type
+    FROM andes.nova_ddl.warehouse_attributes wa
+            --  LEFT JOIN fc_region_mapping FC
+            --           ON wa.warehouse_id = FC.FC
+            --               AND FC.cluster_name = 'Oak'
+             LEFT JOIN andes.longzone.FC2REGION fc
+                       ON wa.warehouse_id = fc.FC
+            --  LEFT JOIN zip5_region_mapping RM
+            --           ON SUBSTRING(wa.location_postal, 1, 5) = RM.Zip5
+            LEFT JOIN andes.longzone.zip2region RM
+                    ON SUBSTRING(wa.location_postal, 1, 5) = left(RM.Zip5,5)
+         --AND RM.cluster_name = 'Oak'   -- No cluster in Zip5 mapping table
+    WHERE 1 = 1
+      AND wa.region_id = 'NA'
+      AND wa.is_current = 1
+      --AND wa.physical_country = 'US'
+      --AND wa.legal_entity_id = 101
+    ---- Check with Srini on this, this logic is from Placement query and it excluded both RIS and RA
+    and lower(warehouse_reporting_type) not in ('primenow','amazonfresh','campus','customerservicecenter','deliverystation','fresh','ixd','sortcenter') -- updated version that allows dropship
+    and (substring(warehouse_id,1,2) = 'VU' or lower(warehouse_reporting_type) <> 'unknown') -- exclude all unknowns unless they have VU prefix indicating vendorflex
+;
+
+
+
+
+--- Some of the FCs are mapped to multiple regions, so to avoid duuplication, concatenating the multiple regions with ',' seperated for FCs. Exp FCs 'OKC1','TUL2' mapped to TX,GL 
+--- Note: While performing a backfill, ned to check with jemil on old mappings and udpate the code
+CREATE TEMP TABLE FCRM AS
+SELECT 
+    FC.FC,
+    FC.fulfillment_node_type,
+    LISTAGG(FC.FC_Region, ',') WITHIN GROUP (ORDER BY FC.FC_Region) as FC_Region
+FROM FC_MAPPING FC
+WHERE FC.FC_Region is not null
+GROUP BY 1,2;
+
+
+
+
+CREATE TEMP TABLE fc AS
+-- fc data
+SELECT DISTINCT wa.warehouse_id
+       , wa.warehouse_reporting_type
+       , wa.location_postal fc_zip
+       , wa.legal_entity_id
+       , SUBSTRING(wa.location_postal,1,5) AS fc_zip5
+FROM andes.nova_ddl.warehouse_attributes wa
+WHERE 1 = 1
+AND   wa.region_id = 'NA'
+AND   wa.is_current = 1
+;
+--CACHE TABLE fc;
+
+-- CREATE TEMP TABLE SSD_ZIPS AS
+--     SELECT BZC.ZIP_CODE,
+--               BZC.START_DATE,
+--               NVL(BZC.END_DATE,DATE_ADD(START_DATE,3650))AS END_DATE,
+--               BZC.SITE
+--               --, START_DATE, END_DATE, SITE
+--         FROM BORDEN_ZIP_COVERAGE BZC
+--         WHERE BZC.MARKETPLACE_ID = 7
+--           AND BZC.REGION_ID =1
+-- ;
+
+CREATE TEMP TABLE d_wbr_marketplace_map AS
+SELECT
+A.marketplace_id,
+a.marketplace_name,
+a.default_language_code,
+a.default_currency_code,
+a.default_time_zone_name,
+NVL(C.DEFAULT_COUNTRY_CODE,
+CASE WHEN a.default_country_code ='GB' then 'UK' ELSE a.default_country_code END) as default_country_code,
+a.default_weight_unit_name,
+CAST(NVL(C.IS_AMAZON_CORE,'N') AS CHAR(1) ) AS IS_CORE_RETAIL_FOR_WBR,
+  --the column IS_CORE_RETAIL_FOR_WBR is also similar to E.is_core_amazon_mp from D_MP_LEGAL_ENTITY_MAP
+--CAST((case when d.marketplace_id is not null then 'Y' else 'N' end) AS CHAR(1)) AS IS_AMAZON_OWNED,
+E.IS_CDW AS IS_CDW,
+E.LEGAL_ENTITY_ID as LEGAL_ENTITY_ID,
+E.REGION_CODE as REGION_CODE,
+E.REGION_ID as REGION_ID,
+C.COUNTRY_ORDER AS WBR_COUNTRY_ORDER
+FROM
+  andes.booker.O_MS_MARKETPLACES A
+    LEFT JOIN
+  andes.intl_fin_ddl.mp_finance C ON (a.marketplace_id=c.marketplace_id)
+  /*  LEFT OUTER JOIN
+  (SELECT * FROM GLANCE_VIEW_METRICS.D_CDW_MARKETPLACES_MAP where marketplace_id <>2) D ON (a.marketplace_id=d.marketplace_id)*/
+    INNER JOIN
+  andes.booker.D_MP_LEGAL_ENTITY_MAP E ON (a.marketplace_id=e.marketplace_id)
+  ;
+
+CREATE TEMP TABLE mp AS
+SELECT /*+ BROADCAST(tz) */
+         wbr.region_id
+       , wbr.legal_entity_id
+       , wbr.marketplace_id
+       , wbr.marketplace_name
+       , wbr.is_core_retail_for_wbr
+       , CASE WHEN wbr.default_country_code = 'UK' THEN 'GB' ELSE wbr.default_country_code END default_country_code
+       , wbr.default_currency_code
+       , tz.time_zone
+FROM d_wbr_marketplace_map wbr
+  JOIN andes.BDT_ANALYTICS_PROD.legal_entity_timezone_map tz ON wbr.legal_entity_id = tz.legal_entity_id
+WHERE 1 = 1
+AND   wbr.region_id = 1
+AND   wbr.is_core_retail_for_wbr = 'Y'
+;
+--CACHE TABLE mp;
+
+CREATE TEMP TABLE ca_zip_details AS
+SELECT distinct
+    LEFT(ZIP5,3) AS zipcode
+    ,region
+FROM andes.longzone.zip2region;
+
+
+
+CREATE TEMP TABLE fzd AS
+-- fc data
+SELECT /*+ BROADCAST(zd) */
+      DISTINCT zzd.fc_postal_code origin
+       , zzd.warehouse_id
+       , zzd.fc_country_code
+       , zzd.dest
+       , zzd.dest_country_code
+    --   , zd.state
+       , zd.region
+       , CAST(ROUND(zzd.distance_meters / (1000*1.609)) AS INT) distance
+FROM andes.FO_INSIGHTS.FC_TO_ZIP_DISTANCE zzd
+  LEFT JOIN ca_zip_details zd ON zzd.dest = zd.zipcode /*both are zip3 fsa*/
+WHERE 1 = 1
+AND zzd.region_id = 1
+AND zzd.warehouse_id IS NOT NULL
+
+--CLUSTER BY origin, dest
+;
+--CACHE TABLE fzd;
+
+CREATE TEMP TABLE fta_core AS
+SELECT /*+ BROADCAST(mp,fc) */
+-- plan identifiers
+       1 AS region_id
+       , fta.creation_date
+       , fta.fulfillment_request_id
+       , fta.fulfillment_request_archive_id
+       , mp.time_zone marketplace_timezone
+       , mp.marketplace_name
+       , mp.default_country_code marketplace_country_code
+       , fta.planning_date
+       , fta.context_name
+       , fta.is_order_fta AS is_order_fta
+-- order attributes
+       , fta.marketplace_id
+       , mp.legal_entity_id
+       , fta.order_archive_id
+       , fta.address_id
+       , fta.order_id
+       , fta.ship_option
+       , fta.country AS customer_country
+       , fta.zip_code customer_zip
+       , SUBSTRING(fta.zip_code,1,5) customer_zip5
+       , SUBSTRING(fta.zip_code,1,2) customer_zip2
+      , SPLIT_PART(fta.zip_code, ' ', 1) customer_zip_space
+       , fta.order_date
+-- item attributes
+       , fta.is_order_FT is_item_ft
+       , fta.fnsku
+       , fta.iaid
+       , fta.line_item_id
+       , fta.customer_order_item_id
+       , fta.iog
+       , CASE
+         WHEN fta.iog > 130 THEN 'Y'
+         ELSE 'N'
+       END is_fba
+       , fta.is_hazmat AS is_hazmat
+       , fta.sortability
+       , fta.gl_product_group
+       , fta.planned_Shipment_Id
+       , fta.internal_pdd
+       , GREATEST(fta.is_nyp,fta.is_not_published) is_nyp
+--- assignment details
+       , fta.shipment_archive_id
+       , fta.fc_name
+       , fta.ship_method
+       , CASE
+    WHEN fta.transship_from IS NOT NULL THEN 'Transship-' || COALESCE(fta.transship_from,'')
+    ELSE fta.supply_type
+  END supply_type
+       , fta.transship_from
+       , fta.supply_time
+       , fta.box_type
+       , fta.box_barcode
+       , fta.box_volume
+-- aggregates
+       , fta.quantity
+       , fta.units_per_shipment
+       , fta.ship_cpu
+       , fta.picking_cpu
+       , fta.packing_cpu
+       , fta.transship_cpu
+       , fta.shipping_cost
+       , fta.packing_cps
+       , fta.transship_cost
+       , fta.atrops_penalty_cost_cps
+       , fta.atrops_penalty_cpu
+       , fta.plan_opportunity_cost
+       , fta.opportunity_cpu
+       , fta.inbound_cost
+       , fta.inbound_cpu
+       , fta.sourcing_cpu
+       , fta.lb_cpu_by_wt
+       , fta.ramp_cost
+       , fta.shipment_penalty_cost
+       , fta.total_cost
+-- constraints
+       , fta.constraint_fasttrack
+       , fta.constraint_item_dims_ovrd_box
+       , fta.constraint_last_chance
+       , fta.constraint_pdd
+       , fta.constraint_psd
+       , fta.constraint_unknown_avail
+       , fta.constraint_pdd_fasttrack
+       , fta.constraint_pdd_non_fasttrack
+       , fta.constraint_pdd_unknown_promise
+       , fta.constraint_psd_fasttrack
+       , fta.constraint_psd_non_fasttrack
+       , fta.constraint_psd_unknown_promise
+       , FCRM.FC_Region as FC_Region
+       , Z5.region as Customer_region
+-- fc info
+       , CASE
+         WHEN fc.warehouse_id IS NULL THEN 0
+         ELSE 1
+       END demand_has_fc_data
+       , nvl(fc.warehouse_reporting_type,'no fc data') warehouse_reporting_type
+       , fc.fc_zip
+       , fc.fc_zip5
+       , CASE
+         WHEN fc.legal_entity_id = mp.legal_entity_id THEN 0
+         ELSE 1
+       END is_remote_fulfilled
+      , fc.fc_zip5 || '-' || substring(fta.zip_code,1,5) as zip_combo
+       , rank() over(PARTITION by context_name, line_item_id order by fc_name desc) as Region_Rnk_Flag
+FROM andes.ORDER_ASSIGNMENT.DENORMALIZED_ARCHIVE_123d fta
+-- joining to get core marketplaces, domestic shipments only
+  INNER JOIN mp
+    ON mp.region_id = 1
+   AND fta.marketplace_id = mp.marketplace_id
+   AND fta.country = mp.default_country_code
+  LEFT JOIN fc ON fta.fc_name = fc.warehouse_id
+  LEFT JOIN FCRM on FCRM.FC = fta.fc_name
+--   LEFT JOIN zip5_region_mapping Z5 on Z5.Zip5 = SUBSTRING(fta.zip_code,1,5)
+  LEFT JOIN andes.longzone.zip2region z5 on left(Z5.zip5,5) = SUBSTRING(fta.zip_code,1,5)
+  
+  
+WHERE 1 = 1
+AND   fta.REGION_ID = 1 
+AND   fta.CREATION_Date >= to_date('{RUN_DATE_YYYY/MM/DD}', 'YYYY/MM/DD') - 1
+AND   fta.CREATION_Date < to_date('{RUN_DATE_YYYY/MM/DD}', 'YYYY/MM/DD')
+AND   fta.marketplace_id = 7
+AND   fta.is_fulfillment_fta = 1
+AND   fta.is_order_fta = 1
+AND   fta.is_redecide = 0
+AND   fta.ship_cpu > 0
+AND   fta.context_name IN ('f2p_production'
+                          , 'f2p_baseline'
+                          , 'f2p_infinite_inventory_baseline'
+                          , 'f2p_unconstrained_atrops'
+                          , 'f2p_baseline_line_item_grouped'
+                          , 'f2p_unconstrained_atrops_no_spock'
+                          , 'f2p_no_atrops_penalty_cost'
+                          , 'f2p_no_spock'
+                          , 'f2p_no_inbound_cost'
+                          , 'f2p_no_inbound_and_unit_costs'
+                          , 'f2p_within_region_supply'
+                          , 'f2p_within_local_supply'  --- Added by Navtan, Adding new sim Wlocal supply data
+                          , 'f2p_hard_regionalization'
+                          , 'f2p_no_transship_cost'
+                          , 'f2p_no_fc_limit_cost'
+                          , 'f2p_no_target_cost'
+                          , 'f2p_no_offset_cost'
+                          , 'f2p_no_risk_cost'
+                          , 'f2p_no_od_cost'
+                          , 'css_prioritize_direct_lane_assignment')--- Added by Navtan, Adding new sim hard_regionalization data
+AND   fta.shipment_id IS NULL
+
+--CLUSTER BY order_archive_id, fnsku
+;
+
+--CACHE TABLE fta_core;
+
+CREATE TEMP TABLE fta AS
+SELECT
+         fta.*
+    --   , zzd.state
+       , zzd.region
+-- distances (weighted, non-weighted, bucket)
+       , CASE
+         WHEN zzd.distance IS NULL THEN 0
+         ELSE 1
+       END demand_has_dist_data
+       , zzd.distance distance
+       , CASE
+         WHEN zzd.distance <= 100 THEN 'sublocal'
+         WHEN zzd.distance > 100 AND zzd.distance <= 160 THEN 'local'
+         WHEN zzd.distance > 160 AND zzd.distance <= 1000 THEN 'regional'
+         WHEN zzd.distance > 1000 THEN 'national'
+         WHEN zzd.distance IS NULL THEN 'no distance data'
+         ELSE 'other'
+       END distance_bucket
+FROM fta_core fta
+  LEFT JOIN fzd zzd
+         ON fta.fc_name = zzd.warehouse_id
+        AND left(fta.customer_zip,3) = left(zzd.dest,3)
+        AND fta.customer_country = zzd.dest_country_code
+WHERE 1 = 1
+;
+
+CREATE TEMP TABLE fta_denorm AS
+SELECT
+-- plan identifiers, context-agnostic here
+       fta.region_id
+       , fta.creation_date
+       , fta.fulfillment_request_id
+       , fta.marketplace_timezone
+       , fta.marketplace_country_code
+       , fta.marketplace_name
+       , fta.planning_date
+-- order attributes
+       , fta.marketplace_id
+       , fta.legal_entity_id
+       , fta.address_id
+       , fta.order_id
+       , fta.customer_country
+    --   , fta.state
+       , fta.region
+       , fta.customer_zip
+       , fta.customer_zip5
+       , fta.Customer_region
+       , fta.order_date
+-- item attributes
+       , fta.is_item_ft
+       , fta.internal_pdd
+       , fta.fnsku
+       , fta.iaid
+       , fta.line_item_id
+       , fta.customer_order_item_id
+       , fta.gl_product_group
+       , fta.is_hazmat
+       , fta.is_nyp
+       , fta.sortability
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.fulfillment_request_archive_id ELSE NULL END) fulfillment_request_archive_id
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.ship_option ELSE NULL END) ship_option
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.is_fba ELSE NULL END) is_fba
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.order_archive_id ELSE NULL END) order_archive_id
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.planned_Shipment_Id ELSE NULL END) planned_Shipment_Id
+--
+       , COUNT(DISTINCT (fta.context_name)) count_sims
+       , COUNT(DISTINCT (CASE WHEN fta.demand_has_dist_data = 1 THEN fta.context_name ELSE NULL END)) count_sims_with_dist_data
+       , COUNT(DISTINCT (CASE WHEN fta.demand_has_fc_data = 1 THEN fta.context_name ELSE NULL END)) count_sims_with_fc_data
+--
+       , SUM(CASE WHEN fta.context_name = 'f2p_production' THEN 1 ELSE 0 END) prod_item_assignments
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.fc_name ELSE NULL END) prod_fc_name
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' AND Region_Rnk_Flag = 1 THEN fta.FC_Region ELSE NULL END) prod_fc_region
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.supply_type ELSE NULL END) prod_supply_type
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.ship_method ELSE NULL END) prod_ship_method
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.is_remote_fulfilled ELSE NULL END) prod_is_remote_fulfilled
+       , SUM(CASE WHEN fta.context_name = 'f2p_production' THEN fta.quantity ELSE 0 END) prod_quantity
+       , SUM(CASE WHEN fta.context_name = 'f2p_production' THEN fta.ship_cpu + fta.picking_cpu + fta.packing_cpu + fta.transship_cpu ELSE 0 END) prod_costs
+       , SUM(CASE WHEN fta.context_name = 'f2p_production' THEN fta.ship_cpu ELSE 0 END) prod_ship_cpu
+       , SUM(CASE WHEN fta.context_name = 'f2p_production' THEN fta.ship_cpu ELSE 0 END) prod_ship_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_production' THEN fta.picking_cpu ELSE 0 END) prod_picking_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_production' THEN fta.packing_cpu ELSE 0 END) prod_packing_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_production' THEN fta.transship_cpu ELSE 0 END) prod_transship_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_production' THEN fta.atrops_penalty_cpu ELSE 0 END) prod_atrops_penalty_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_production' THEN fta.opportunity_cpu ELSE 0 END) prod_opp_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_production' THEN fta.inbound_cpu ELSE 0 END) prod_inbound_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_production' THEN fta.sourcing_cpu ELSE 0 END) prod_sourcing_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_production' THEN fta.lb_cpu_by_wt ELSE 0 END) prod_lb_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_production' THEN fta.ramp_cost ELSE 0 END) prod_ramp_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_production' THEN fta.shipment_penalty_cost ELSE 0 END) prod_shipment_penalty_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_production' THEN fta.total_cost ELSE 0 END) prod_total_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_production' THEN fta.distance*fta.quantity ELSE 0 END) prod_distance_w
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.distance ELSE NULL END) prod_distance
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.constraint_fasttrack ELSE NULL END) prod_constraint_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.constraint_item_dims_ovrd_box ELSE NULL END) prod_constraint_item_dims_ovrd_box
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.constraint_last_chance ELSE NULL END) prod_constraint_last_chance
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.constraint_pdd ELSE NULL END) prod_constraint_pdd
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.constraint_psd ELSE NULL END) prod_constraint_psd
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.constraint_unknown_avail ELSE NULL END) prod_constraint_unknown_avail
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.constraint_pdd_fasttrack ELSE NULL END) prod_constraint_pdd_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.constraint_pdd_non_fasttrack ELSE NULL END) prod_constraint_pdd_non_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.constraint_pdd_unknown_promise ELSE NULL END) prod_constraint_pdd_unknown_promise
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.constraint_psd_fasttrack ELSE NULL END) prod_constraint_psd_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.constraint_psd_non_fasttrack ELSE NULL END) prod_constraint_psd_non_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.constraint_psd_unknown_promise ELSE NULL END) prod_constraint_psd_unknown_promise
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.box_type END) prod_box_type
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.box_barcode END) prod_box_barcode
+       , MAX(CASE WHEN fta.context_name = 'f2p_production' THEN fta.box_volume ELSE 0 END) prod_box_volume
+       , MIN(CASE WHEN fta.context_name = 'f2p_production' THEN fta.demand_has_dist_data ELSE NULL END) prod_has_dist_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_production' THEN fta.demand_has_fc_data ELSE NULL END) prod_has_fc_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_production' THEN fta.units_per_shipment ELSE NULL END) prod_units_per_shipment
+--
+       , SUM(CASE WHEN fta.context_name = 'f2p_baseline' THEN 1 ELSE 0 END) baseline_item_assignments
+       , MAX(CASE WHEN fta.context_name = 'f2p_baseline' THEN fta.fc_name ELSE NULL END) baseline_fc_name
+       , MAX(CASE WHEN fta.context_name = 'f2p_baseline' AND Region_Rnk_Flag = 1 THEN fta.fc_region ELSE NULL END) baseline_fc_region
+       , MAX(CASE WHEN fta.context_name = 'f2p_baseline' THEN fta.supply_type ELSE NULL END) baseline_supply_type
+       , MAX(CASE WHEN fta.context_name = 'f2p_baseline' THEN fta.ship_method ELSE NULL END) baseline_ship_method
+       , MAX(CASE WHEN fta.context_name = 'f2p_baseline' THEN fta.is_remote_fulfilled ELSE NULL END) baseline_is_remote_fulfilled
+       , SUM(CASE WHEN fta.context_name = 'f2p_baseline' THEN fta.quantity ELSE 0 END) baseline_quantity
+       , SUM(CASE WHEN fta.context_name = 'f2p_baseline' THEN fta.ship_cpu + fta.picking_cpu + fta.packing_cpu + fta.transship_cpu ELSE 0 END) baseline_costs
+       , SUM(CASE WHEN fta.context_name = 'f2p_baseline' THEN fta.distance*fta.quantity ELSE 0 END) baseline_distance_w
+       , MAX(CASE WHEN fta.context_name = 'f2p_baseline' THEN fta.distance ELSE NULL END) baseline_distance
+       , MIN(CASE WHEN fta.context_name = 'f2p_baseline' THEN fta.demand_has_dist_data ELSE NULL END) baseline_has_dist_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_baseline' THEN fta.demand_has_fc_data ELSE NULL END) baseline_has_fc_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_baseline' THEN fta.units_per_shipment ELSE NULL END) baseline_units_per_shipment
+--
+       , SUM(CASE WHEN fta.context_name = 'f2p_infinite_inventory_baseline' THEN 1 ELSE 0 END) inf_inventory_item_assignments
+       , MAX(CASE WHEN fta.context_name = 'f2p_infinite_inventory_baseline' THEN fta.fc_name ELSE NULL END) inf_inventory_fc_name
+       , MAX(CASE WHEN fta.context_name = 'f2p_infinite_inventory_baseline' AND Region_Rnk_Flag = 1 THEN fta.fc_region ELSE NULL END) inf_inventory_fc_region
+       , MAX(CASE WHEN fta.context_name = 'f2p_infinite_inventory_baseline' THEN fta.supply_type ELSE NULL END) inf_inventory_supply_type
+       , MAX(CASE WHEN fta.context_name = 'f2p_infinite_inventory_baseline' THEN fta.ship_method ELSE NULL END) inf_inventory_ship_method
+       , MAX(CASE WHEN fta.context_name = 'f2p_infinite_inventory_baseline' THEN fta.is_remote_fulfilled ELSE NULL END) inf_inventory_is_remote_fulfilled
+       , SUM(CASE WHEN fta.context_name = 'f2p_infinite_inventory_baseline' THEN fta.quantity ELSE 0 END) inf_inventory_quantity
+       , SUM(CASE WHEN fta.context_name = 'f2p_infinite_inventory_baseline' THEN fta.ship_cpu + fta.picking_cpu + fta.packing_cpu + fta.transship_cpu ELSE 0 END) inf_inventory_costs
+       , SUM(CASE WHEN fta.context_name = 'f2p_infinite_inventory_baseline' THEN fta.distance*fta.quantity ELSE 0 END) inf_inventory_distance_w
+       , MAX(CASE WHEN fta.context_name = 'f2p_infinite_inventory_baseline' THEN fta.distance ELSE NULL END) inf_inventory_distance
+       , MIN(CASE WHEN fta.context_name = 'f2p_infinite_inventory_baseline' THEN fta.demand_has_dist_data ELSE NULL END) inf_inventory_has_dist_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_infinite_inventory_baseline' THEN fta.demand_has_fc_data ELSE NULL END) inf_inventory_has_fc_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_infinite_inventory_baseline' THEN fta.units_per_shipment ELSE NULL END) inf_inventory_units_per_shipment
+--
+       , SUM(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops' THEN 1 ELSE 0 END) unconstr_atrops_item_assignments
+       , MAX(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops' THEN fta.fc_name ELSE NULL END) unconstr_atrops_fc_name
+       , MAX(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops' AND Region_Rnk_Flag = 1 THEN fta.fc_region ELSE NULL END) unconstr_atrops_fc_region
+       , MAX(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops' THEN fta.supply_type ELSE NULL END) unconstr_atrops_supply_type
+       , MAX(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops' THEN fta.ship_method ELSE NULL END) unconstr_atrops_ship_method
+       , MAX(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops' THEN fta.is_remote_fulfilled ELSE NULL END) unconstr_atrops_is_remote_fulfilled
+       , SUM(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops' THEN fta.quantity ELSE 0 END) unconstr_atrops_quantity
+       , SUM(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops' THEN fta.ship_cpu + fta.picking_cpu + fta.packing_cpu + fta.transship_cpu ELSE 0 END) unconstr_atrops_costs
+       , SUM(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops' THEN fta.distance*fta.quantity ELSE 0 END) unconstr_atrops_distance_w
+       , MAX(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops' THEN fta.distance ELSE NULL END) unconstr_atrops_distance
+       , MIN(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops' THEN fta.demand_has_dist_data ELSE NULL END) unconstr_atrops_has_dist_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops' THEN fta.demand_has_fc_data ELSE NULL END) unconstr_atrops_has_fc_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops' THEN fta.units_per_shipment ELSE NULL END) unconstr_atrops_units_per_shipment
+--
+       , SUM(CASE WHEN fta.context_name = 'f2p_baseline_line_item_grouped' THEN 1 ELSE 0 END) line_item_grouped_item_assignments
+       , MAX(CASE WHEN fta.context_name = 'f2p_baseline_line_item_grouped' THEN fta.fc_name ELSE NULL END) line_item_grouped_fc_name
+       , MAX(CASE WHEN fta.context_name = 'f2p_baseline_line_item_grouped' AND Region_Rnk_Flag = 1 THEN fta.fc_region ELSE NULL END) line_item_grouped_fc_region
+       , MAX(CASE WHEN fta.context_name = 'f2p_baseline_line_item_grouped' THEN fta.supply_type ELSE NULL END) line_item_grouped_supply_type
+       , MAX(CASE WHEN fta.context_name = 'f2p_baseline_line_item_grouped' THEN fta.ship_method ELSE NULL END) line_item_grouped_ship_method
+       , MAX(CASE WHEN fta.context_name = 'f2p_baseline_line_item_grouped' THEN fta.is_remote_fulfilled ELSE NULL END) line_item_grouped_is_remote_fulfilled
+       , SUM(CASE WHEN fta.context_name = 'f2p_baseline_line_item_grouped' THEN fta.quantity ELSE 0 END) line_item_grouped_quantity
+       , SUM(CASE WHEN fta.context_name = 'f2p_baseline_line_item_grouped' THEN fta.ship_cpu + fta.picking_cpu + fta.packing_cpu + fta.transship_cpu ELSE 0 END) line_item_grouped_costs
+       , SUM(CASE WHEN fta.context_name = 'f2p_baseline_line_item_grouped' THEN fta.distance*fta.quantity ELSE 0 END) line_item_grouped_distance_w
+       , MAX(CASE WHEN fta.context_name = 'f2p_baseline_line_item_grouped' THEN fta.distance ELSE NULL END) line_item_grouped_distance
+       , MIN(CASE WHEN fta.context_name = 'f2p_baseline_line_item_grouped' THEN fta.demand_has_dist_data ELSE NULL END) line_item_grouped_has_dist_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_baseline_line_item_grouped' THEN fta.demand_has_fc_data ELSE NULL END) line_item_grouped_has_fc_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_baseline_line_item_grouped' THEN fta.units_per_shipment ELSE NULL END) line_item_grouped_units_per_shipment
+--
+       , SUM(CASE WHEN fta.context_name = 'f2p_no_spock' THEN 1 ELSE 0 END) no_spock_item_assignments
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_spock' THEN fta.fc_name ELSE NULL END) no_spock_fc_name
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_spock' AND Region_Rnk_Flag = 1 THEN fta.fc_region ELSE NULL END) no_spock_fc_region
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_spock' THEN fta.supply_type ELSE NULL END) no_spock_supply_type
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_spock' THEN fta.ship_method ELSE NULL END) no_spock_ship_method
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_spock' THEN fta.is_remote_fulfilled ELSE NULL END) no_spock_is_remote_fulfilled
+       , SUM(CASE WHEN fta.context_name = 'f2p_no_spock' THEN fta.quantity ELSE 0 END) no_spock_quantity
+       , SUM(CASE WHEN fta.context_name = 'f2p_no_spock' THEN fta.ship_cpu + fta.picking_cpu + fta.packing_cpu + fta.transship_cpu ELSE 0 END) no_spock_costs
+       , SUM(CASE WHEN fta.context_name = 'f2p_no_spock' THEN fta.distance*fta.quantity ELSE 0 END) no_spock_distance_w
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_spock' THEN fta.distance ELSE NULL END) no_spock_distance
+       , MIN(CASE WHEN fta.context_name = 'f2p_no_spock' THEN fta.demand_has_dist_data ELSE NULL END) no_spock_has_dist_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_no_spock' THEN fta.demand_has_fc_data ELSE NULL END) no_spock_has_fc_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_no_spock' THEN fta.units_per_shipment ELSE NULL END) no_spock_units_per_shipment
+--
+       , SUM(CASE WHEN fta.context_name = 'f2p_no_atrops_penalty_cost' THEN 1 ELSE 0 END) no_atrops_pen_cost_item_assignments
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_atrops_penalty_cost' THEN fta.fc_name ELSE NULL END) no_atrops_pen_cost_fc_name
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_atrops_penalty_cost' AND Region_Rnk_Flag = 1 THEN fta.fc_region ELSE NULL END) no_atrops_pen_cost_fc_region
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_atrops_penalty_cost' THEN fta.supply_type ELSE NULL END) no_atrops_pen_cost_supply_type
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_atrops_penalty_cost' THEN fta.ship_method ELSE NULL END) no_atrops_pen_cost_ship_method
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_atrops_penalty_cost' THEN fta.is_remote_fulfilled ELSE NULL END) no_atrops_pen_cost_is_remote_fulfilled
+       , SUM(CASE WHEN fta.context_name = 'f2p_no_atrops_penalty_cost' THEN fta.quantity ELSE 0 END) no_atrops_pen_cost_quantity
+       , SUM(CASE WHEN fta.context_name = 'f2p_no_atrops_penalty_cost' THEN fta.ship_cpu + fta.picking_cpu + fta.packing_cpu + fta.transship_cpu ELSE 0 END) no_atrops_pen_cost_costs
+       , SUM(CASE WHEN fta.context_name = 'f2p_no_atrops_penalty_cost' THEN fta.distance*fta.quantity ELSE 0 END) no_atrops_pen_cost_distance_w
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_atrops_penalty_cost' THEN fta.distance ELSE NULL END) no_atrops_pen_cost_distance
+       , MIN(CASE WHEN fta.context_name = 'f2p_no_atrops_penalty_cost' THEN fta.demand_has_dist_data ELSE NULL END) no_atrops_pen_cost_has_dist_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_no_atrops_penalty_cost' THEN fta.demand_has_fc_data ELSE NULL END) no_atrops_pen_cost_has_fc_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_no_atrops_penalty_cost' THEN fta.units_per_shipment ELSE NULL END) no_atrops_pen_cost_units_per_shipment
+--
+       , SUM(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops_no_spock' THEN 1 ELSE 0 END) no_spock_no_caps_item_assignments
+       , MAX(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops_no_spock' THEN fta.fc_name ELSE NULL END) no_spock_no_caps_fc_name
+       , MAX(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops_no_spock' AND Region_Rnk_Flag = 1 THEN fta.fc_region ELSE NULL END) no_spock_no_caps_fc_region
+       , MAX(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops_no_spock' THEN fta.supply_type ELSE NULL END) no_spock_no_caps_supply_type
+       , MAX(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops_no_spock' THEN fta.ship_method ELSE NULL END) no_spock_no_caps_ship_method
+       , MAX(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops_no_spock' THEN fta.is_remote_fulfilled ELSE NULL END) no_spock_no_caps_is_remote_fulfilled
+       , SUM(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops_no_spock' THEN fta.quantity ELSE 0 END) no_spock_no_caps_quantity
+       , SUM(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops_no_spock' THEN fta.ship_cpu + fta.picking_cpu + fta.packing_cpu + fta.transship_cpu ELSE 0 END) no_spock_no_caps_costs
+       , SUM(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops_no_spock' THEN fta.distance*fta.quantity ELSE 0 END) no_spock_no_caps_distance_w
+       , MAX(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops_no_spock' THEN fta.distance ELSE NULL END) no_spock_no_caps_distance
+       , MIN(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops_no_spock' THEN fta.demand_has_dist_data ELSE NULL END) no_spock_no_caps_has_dist_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops_no_spock' THEN fta.demand_has_fc_data ELSE NULL END) no_spock_no_caps_has_fc_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_unconstrained_atrops_no_spock' THEN fta.units_per_shipment ELSE NULL END) no_spock_no_caps_units_per_shipment
+--
+       , SUM(CASE WHEN fta.context_name = 'f2p_no_inbound_cost' THEN 1 ELSE 0 END) no_inbound_cost_item_assignments
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_inbound_cost' THEN fta.fc_name ELSE NULL END) no_inbound_cost_fc_name
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_inbound_cost' AND Region_Rnk_Flag = 1 THEN fta.fc_region ELSE NULL END) no_inbound_cost_fc_region
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_inbound_cost' THEN fta.supply_type ELSE NULL END) no_inbound_cost_supply_type
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_inbound_cost' THEN fta.ship_method ELSE NULL END) no_inbound_cost_ship_method
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_inbound_cost' THEN fta.is_remote_fulfilled ELSE NULL END) no_inbound_cost_is_remote_fulfilled
+       , SUM(CASE WHEN fta.context_name = 'f2p_no_inbound_cost' THEN fta.quantity ELSE 0 END) no_inbound_cost_quantity
+       , SUM(CASE WHEN fta.context_name = 'f2p_no_inbound_cost' THEN fta.ship_cpu + fta.picking_cpu + fta.packing_cpu + fta.transship_cpu ELSE 0 END) no_inbound_cost_costs
+       , SUM(CASE WHEN fta.context_name = 'f2p_no_inbound_cost' THEN fta.distance*fta.quantity ELSE 0 END) no_inbound_cost_distance_w
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_inbound_cost' THEN fta.distance ELSE NULL END) no_inbound_cost_distance
+       , MIN(CASE WHEN fta.context_name = 'f2p_no_inbound_cost' THEN fta.demand_has_dist_data ELSE NULL END) no_inbound_cost_has_dist_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_no_inbound_cost' THEN fta.demand_has_fc_data ELSE NULL END) no_inbound_cost_has_fc_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_no_inbound_cost' THEN fta.units_per_shipment ELSE NULL END) no_inbound_cost_units_per_shipment
+--
+       , SUM(CASE WHEN fta.context_name = 'f2p_no_inbound_and_unit_costs' THEN 1 ELSE 0 END) no_inbound_no_item_cost_item_assignments
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_inbound_and_unit_costs' THEN fta.fc_name ELSE NULL END) no_inbound_no_item_cost_fc_name
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_inbound_and_unit_costs' AND Region_Rnk_Flag = 1 THEN fta.fc_region ELSE NULL END) no_inbound_no_item_cost_fc_region
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_inbound_and_unit_costs' THEN fta.supply_type ELSE NULL END) no_inbound_no_item_cost_supply_type
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_inbound_and_unit_costs' THEN fta.ship_method ELSE NULL END) no_inbound_no_item_cost_ship_method
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_inbound_and_unit_costs' THEN fta.is_remote_fulfilled ELSE NULL END) no_inbound_no_item_cost_is_remote_fulfilled
+       , SUM(CASE WHEN fta.context_name = 'f2p_no_inbound_and_unit_costs' THEN fta.quantity ELSE 0 END) no_inbound_no_item_cost_quantity
+       , SUM(CASE WHEN fta.context_name = 'f2p_no_inbound_and_unit_costs' THEN fta.ship_cpu + fta.picking_cpu + fta.packing_cpu + fta.transship_cpu ELSE 0 END) no_inbound_no_item_cost_costs
+       , SUM(CASE WHEN fta.context_name = 'f2p_no_inbound_and_unit_costs' THEN fta.distance*fta.quantity ELSE 0 END) no_inbound_no_item_cost_distance_w
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_inbound_and_unit_costs' THEN fta.distance ELSE NULL END) no_inbound_no_item_cost_distance
+       , MIN(CASE WHEN fta.context_name = 'f2p_no_inbound_and_unit_costs' THEN fta.demand_has_dist_data ELSE NULL END) no_inbound_no_item_cost_has_dist_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_no_inbound_and_unit_costs' THEN fta.demand_has_fc_data ELSE NULL END) no_inbound_no_item_cost_has_fc_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_no_inbound_and_unit_costs' THEN fta.units_per_shipment ELSE NULL END) no_inbound_no_item_cost_units_per_shipment
+--
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN 1 ELSE 0 END) wregion_supply_item_assignments
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.fc_name ELSE NULL END) wregion_supply_fc_name
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_region_supply' AND Region_Rnk_Flag = 1 THEN fta.fc_region ELSE NULL END) wregion_supply_fc_region
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.supply_type ELSE NULL END) wregion_supply_supply_type
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.ship_method ELSE NULL END) wregion_supply_ship_method
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.is_remote_fulfilled ELSE NULL END) wregion_supply_is_remote_fulfilled
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.quantity ELSE 0 END) wregion_supply_quantity
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.ship_cpu + fta.picking_cpu + fta.packing_cpu + fta.transship_cpu ELSE 0 END) wregion_supply_costs
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.ship_cpu ELSE 0 END) wregion_supply_ship_cpu
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.ship_cpu ELSE 0 END) wregion_supply_ship_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.picking_cpu ELSE 0 END) wregion_supply_picking_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.packing_cpu ELSE 0 END) wregion_supply_packing_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.transship_cpu ELSE 0 END) wregion_supply_transship_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.atrops_penalty_cpu ELSE 0 END) wregion_supply_atrops_penalty_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.opportunity_cpu ELSE 0 END) wregion_supply_opp_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.inbound_cpu ELSE 0 END) wregion_supply_inbound_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.sourcing_cpu ELSE 0 END) wregion_supply_sourcing_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.lb_cpu_by_wt ELSE 0 END) wregion_supply_lb_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.ramp_cost ELSE 0 END) wregion_supply_ramp_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.shipment_penalty_cost ELSE 0 END) wregion_supply_shipment_penalty_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.total_cost ELSE 0 END) wregion_supply_total_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.distance * fta.quantity ELSE 0 END) wregion_supply_distance_w
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.distance ELSE NULL END) wregion_supply_distance
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.constraint_fasttrack ELSE NULL END) wregion_supply_constraint_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.constraint_item_dims_ovrd_box ELSE NULL END) wregion_supply_constraint_item_dims_ovrd_box
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.constraint_last_chance ELSE NULL END) wregion_supply_constraint_last_chance
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.constraint_pdd ELSE NULL END) wregion_supply_constraint_pdd
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.constraint_psd ELSE NULL END) wregion_supply_constraint_psd
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.constraint_unknown_avail ELSE NULL END) wregion_supply_constraint_unknown_avail
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.constraint_pdd_fasttrack ELSE NULL END) wregion_supply_constraint_pdd_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.constraint_pdd_non_fasttrack ELSE NULL END) wregion_supply_constraint_pdd_non_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.constraint_pdd_unknown_promise ELSE NULL END) wregion_supply_constraint_pdd_unknown_promise
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.constraint_psd_fasttrack ELSE NULL END) wregion_supply_constraint_psd_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.constraint_psd_non_fasttrack ELSE NULL END) wregion_supply_constraint_psd_non_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.constraint_psd_unknown_promise ELSE NULL END) wregion_supply_constraint_psd_unknown_promise
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.box_type END) wregion_supply_box_type
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.box_barcode END) wregion_supply_box_barcode
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.box_volume ELSE 0 END) wregion_supply_box_volume
+       , MIN(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.demand_has_dist_data ELSE NULL END) wregion_supply_has_dist_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.demand_has_fc_data ELSE NULL END) wregion_supply_has_fc_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_within_region_supply' THEN fta.units_per_shipment ELSE NULL END) wregion_supply_units_per_shipment
+--Added by navtan, Adding new sim Wlocal supply data
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN 1 ELSE 0 END) wlocal_supply_item_assignments
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.fc_name ELSE NULL END) wlocal_supply_fc_name
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_local_supply' AND Region_Rnk_Flag = 1 THEN fta.fc_region ELSE NULL END) wlocal_supply_fc_region
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.supply_type ELSE NULL END) wlocal_supply_supply_type
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.ship_method ELSE NULL END) wlocal_supply_ship_method
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.is_remote_fulfilled ELSE NULL END) wlocal_supply_is_remote_fulfilled
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.quantity ELSE 0 END) wlocal_supply_quantity
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.ship_cpu + fta.picking_cpu + fta.packing_cpu + fta.transship_cpu ELSE 0 END) wlocal_supply_costs
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.ship_cpu ELSE 0 END) wlocal_supply_ship_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.picking_cpu ELSE 0 END) wlocal_supply_picking_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.packing_cpu ELSE 0 END) wlocal_supply_packing_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.transship_cpu ELSE 0 END) wlocal_supply_transship_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.atrops_penalty_cpu ELSE 0 END) wlocal_supply_atrops_penalty_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.opportunity_cpu ELSE 0 END) wlocal_supply_opp_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.inbound_cpu ELSE 0 END) wlocal_supply_inbound_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.sourcing_cpu ELSE 0 END) wlocal_supply_sourcing_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.lb_cpu_by_wt ELSE 0 END) wlocal_supply_lb_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.ramp_cost ELSE 0 END) wlocal_supply_ramp_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.shipment_penalty_cost ELSE 0 END) wlocal_supply_shipment_penalty_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.total_cost ELSE 0 END) wlocal_supply_total_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.distance * fta.quantity ELSE 0 END) wlocal_supply_distance_w
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.distance ELSE NULL END) wlocal_supply_distance
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.constraint_fasttrack ELSE NULL END) wlocal_supply_constraint_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.constraint_item_dims_ovrd_box ELSE NULL END) wlocal_supply_constraint_item_dims_ovrd_box
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.constraint_last_chance ELSE NULL END) wlocal_supply_constraint_last_chance
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.constraint_pdd ELSE NULL END) wlocal_supply_constraint_pdd
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.constraint_psd ELSE NULL END) wlocal_supply_constraint_psd
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.constraint_unknown_avail ELSE NULL END) wlocal_supply_constraint_unknown_avail
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.constraint_pdd_fasttrack ELSE NULL END) wlocal_supply_constraint_pdd_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.constraint_pdd_non_fasttrack ELSE NULL END) wlocal_supply_constraint_pdd_non_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.constraint_pdd_unknown_promise ELSE NULL END) wlocal_supply_constraint_pdd_unknown_promise
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.constraint_psd_fasttrack ELSE NULL END) wlocal_supply_constraint_psd_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.constraint_psd_non_fasttrack ELSE NULL END) wlocal_supply_constraint_psd_non_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.constraint_psd_unknown_promise ELSE NULL END) wlocal_supply_constraint_psd_unknown_promise
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.box_type END) wlocal_supply_box_type
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.box_barcode END) wlocal_supply_box_barcode
+       , MAX(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.box_volume ELSE 0 END) wlocal_supply_box_volume
+       , MIN(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.demand_has_dist_data ELSE NULL END) wlocal_supply_has_dist_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.demand_has_fc_data ELSE NULL END) wlocal_supply_has_fc_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_within_local_supply' THEN fta.units_per_shipment ELSE NULL END) wlocal_supply_units_per_shipment
+--Added by navtan, Adding new sim f2p_hard_regionalization data
+       , SUM(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN 1 ELSE 0 END) hard_regionalization_item_assignments
+       , MAX(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.fc_name ELSE NULL END) hard_regionalization_fc_name
+       , MAX(CASE WHEN fta.context_name = 'f2p_hard_regionalization' AND Region_Rnk_Flag = 1 THEN fta.fc_region ELSE NULL END) hard_regionalization_fc_region
+       , MAX(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.supply_type ELSE NULL END) hard_regionalization_supply_type
+       , MAX(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.ship_method ELSE NULL END) hard_regionalization_ship_method
+       , MAX(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.is_remote_fulfilled ELSE NULL END) hard_regionalization_is_remote_fulfilled
+       , SUM(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.quantity ELSE 0 END) hard_regionalization_quantity
+       , SUM(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.ship_cpu + fta.picking_cpu + fta.packing_cpu + fta.transship_cpu ELSE 0 END) hard_regionalization_costs
+       , SUM(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.ship_cpu ELSE 0 END) hard_regionalization_ship_cpu
+       , SUM(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.ship_cpu ELSE 0 END) hard_regionalization_ship_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.picking_cpu ELSE 0 END) hard_regionalization_picking_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.packing_cpu ELSE 0 END) hard_regionalization_packing_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.transship_cpu ELSE 0 END) hard_regionalization_transship_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.atrops_penalty_cpu ELSE 0 END) hard_regionalization_atrops_penalty_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.opportunity_cpu ELSE 0 END) hard_regionalization_opp_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.inbound_cpu ELSE 0 END) hard_regionalization_inbound_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.sourcing_cpu ELSE 0 END) hard_regionalization_sourcing_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.lb_cpu_by_wt ELSE 0 END) hard_regionalization_lb_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.ramp_cost ELSE 0 END) hard_regionalization_ramp_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.shipment_penalty_cost ELSE 0 END) hard_regionalization_shipment_penalty_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.total_cost ELSE 0 END) hard_regionalization_total_cost
+       , SUM(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.distance * fta.quantity ELSE 0 END) hard_regionalization_distance_w
+       , MAX(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.distance ELSE NULL END) hard_regionalization_distance
+       , MAX(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.constraint_fasttrack ELSE NULL END) hard_regionalization_constraint_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.constraint_item_dims_ovrd_box ELSE NULL END) hard_regionalization_constraint_item_dims_ovrd_box
+       , MAX(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.constraint_last_chance ELSE NULL END) hard_regionalization_constraint_last_chance
+       , MAX(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.constraint_pdd ELSE NULL END) hard_regionalization_constraint_pdd
+       , MAX(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.constraint_psd ELSE NULL END) hard_regionalization_constraint_psd
+       , MAX(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.constraint_unknown_avail ELSE NULL END) hard_regionalization_constraint_unknown_avail
+       , MAX(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.constraint_pdd_fasttrack ELSE NULL END) hard_regionalization_constraint_pdd_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.constraint_pdd_non_fasttrack ELSE NULL END) hard_regionalization_constraint_pdd_non_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.constraint_pdd_unknown_promise ELSE NULL END) hard_regionalization_constraint_pdd_unknown_promise
+       , MAX(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.constraint_psd_fasttrack ELSE NULL END) hard_regionalization_constraint_psd_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.constraint_psd_non_fasttrack ELSE NULL END) hard_regionalization_constraint_psd_non_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.constraint_psd_unknown_promise ELSE NULL END) hard_regionalization_constraint_psd_unknown_promise
+       , MAX(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.box_type END) hard_regionalization_box_type
+       , MAX(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.box_barcode END) hard_regionalization_box_barcode
+       , MAX(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.box_volume ELSE 0 END) hard_regionalization_box_volume
+       , MIN(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.demand_has_dist_data ELSE NULL END) hard_regionalization_has_dist_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.demand_has_fc_data ELSE NULL END) hard_regionalization_has_fc_data
+       , MIN(CASE WHEN fta.context_name = 'f2p_hard_regionalization' THEN fta.units_per_shipment ELSE NULL END) hard_regionalization_units_per_shipment
+       
+       
+
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_transship_cost' THEN fta.fc_name ELSE NULL END) no_transship_cost_fc_name
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_transship_cost' AND Region_Rnk_Flag = 1 THEN fta.fc_region ELSE NULL END) no_transship_cost_fc_region
+--        , MAX(CASE WHEN fta.context_name = 'f2p_no_transship_cost' THEN fta.ship_method ELSE NULL END) no_transship_cost_ship_method
+       , SUM(CASE WHEN fta.context_name = 'f2p_no_transship_cost' THEN fta.quantity ELSE 0 END) no_transship_cost_quantity
+--        , SUM(CASE WHEN fta.context_name = 'f2p_no_transship_cost' THEN fta.distance*fta.quantity ELSE 0 END) no_transship_cost_distance_w
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_transship_cost' THEN fta.distance ELSE NULL END) no_transship_cost_distance
+--        , MIN(CASE WHEN fta.context_name = 'f2p_no_transship_cost' THEN fta.units_per_shipment ELSE NULL END) no_transship_cost_units_per_shipment
+
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_fc_limit_cost' THEN fta.fc_name ELSE NULL END) no_fc_limit_cost_fc_name
+     , MAX(CASE WHEN fta.context_name = 'f2p_no_fc_limit_cost' AND Region_Rnk_Flag = 1 THEN fta.fc_region ELSE NULL END) no_fc_limit_cost_fc_region
+--      , MAX(CASE WHEN fta.context_name = 'f2p_no_fc_limit_cost' THEN fta.ship_method ELSE NULL END) no_fc_limit_cost_ship_method
+     , SUM(CASE WHEN fta.context_name = 'f2p_no_fc_limit_cost' THEN fta.quantity ELSE 0 END) no_fc_limit_cost_quantity
+--      , SUM(CASE WHEN fta.context_name = 'f2p_no_fc_limit_cost' THEN fta.distance*fta.quantity ELSE 0 END) no_fc_limit_cost_distance_w
+     , MAX(CASE WHEN fta.context_name = 'f2p_no_fc_limit_cost' THEN fta.distance ELSE NULL END) no_fc_limit_cost_distance
+--      , MIN(CASE WHEN fta.context_name = 'f2p_no_fc_limit_cost' THEN fta.units_per_shipment ELSE NULL END) no_fc_limit_cost_units_per_shipment
+
+
+     , MAX(CASE WHEN fta.context_name = 'f2p_no_target_cost' THEN fta.fc_name ELSE NULL END) no_target_cost_fc_name
+     , MAX(CASE WHEN fta.context_name = 'f2p_no_target_cost' AND Region_Rnk_Flag = 1 THEN fta.fc_region ELSE NULL END) no_target_cost_fc_region
+--      , MAX(CASE WHEN fta.context_name = 'f2p_no_target_cost' THEN fta.ship_method ELSE NULL END) no_target_cost_ship_method
+     , SUM(CASE WHEN fta.context_name = 'f2p_no_target_cost' THEN fta.quantity ELSE 0 END) no_target_cost_quantity
+--      , SUM(CASE WHEN fta.context_name = 'f2p_no_target_cost' THEN fta.distance*fta.quantity ELSE 0 END) no_target_cost_distance_w
+     , MAX(CASE WHEN fta.context_name = 'f2p_no_target_cost' THEN fta.distance ELSE NULL END) no_target_cost_distance
+--      , MIN(CASE WHEN fta.context_name = 'f2p_no_target_cost' THEN fta.units_per_shipment ELSE NULL END) no_target_cost_units_per_shipment
+
+
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_offset_cost' THEN fta.fc_name ELSE NULL END) no_offset_cost_fc_name
+     , MAX(CASE WHEN fta.context_name = 'f2p_no_offset_cost' AND Region_Rnk_Flag = 1 THEN fta.fc_region ELSE NULL END) no_offset_cost_fc_region
+--      , MAX(CASE WHEN fta.context_name = 'f2p_no_offset_cost' THEN fta.ship_method ELSE NULL END) no_offset_cost_ship_method
+     , SUM(CASE WHEN fta.context_name = 'f2p_no_offset_cost' THEN fta.quantity ELSE 0 END) no_offset_cost_quantity
+--      , SUM(CASE WHEN fta.context_name = 'f2p_no_offset_cost' THEN fta.distance*fta.quantity ELSE 0 END) no_offset_cost_distance_w
+     , MAX(CASE WHEN fta.context_name = 'f2p_no_offset_cost' THEN fta.distance ELSE NULL END) no_offset_cost_distance
+--      , MIN(CASE WHEN fta.context_name = 'f2p_no_offset_cost' THEN fta.units_per_shipment ELSE NULL END) no_offset_cost_units_per_shipment
+
+
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_risk_cost' THEN fta.fc_name ELSE NULL END) no_risk_cost_fc_name
+     , MAX(CASE WHEN fta.context_name = 'f2p_no_risk_cost' AND Region_Rnk_Flag = 1 THEN fta.fc_region ELSE NULL END) no_risk_cost_fc_region
+--      , MAX(CASE WHEN fta.context_name = 'f2p_no_risk_cost' THEN fta.ship_method ELSE NULL END) no_risk_cost_ship_method
+     , SUM(CASE WHEN fta.context_name = 'f2p_no_risk_cost' THEN fta.quantity ELSE 0 END) no_risk_cost_quantity
+--      , SUM(CASE WHEN fta.context_name = 'f2p_no_risk_cost' THEN fta.distance*fta.quantity ELSE 0 END) no_risk_cost_distance_w
+     , MAX(CASE WHEN fta.context_name = 'f2p_no_risk_cost' THEN fta.distance ELSE NULL END) no_risk_cost_distance
+--      , MIN(CASE WHEN fta.context_name = 'f2p_no_risk_cost' THEN fta.units_per_shipment ELSE NULL END) no_risk_cost_units_per_shipment
+
+
+
+       , MAX(CASE WHEN fta.context_name = 'f2p_no_od_cost' THEN fta.fc_name ELSE NULL END) no_od_cost_fc_name
+     , MAX(CASE WHEN fta.context_name = 'f2p_no_od_cost' AND Region_Rnk_Flag = 1 THEN fta.fc_region ELSE NULL END) no_od_cost_fc_region
+--      , MAX(CASE WHEN fta.context_name = 'f2p_no_od_cost' THEN fta.ship_method ELSE NULL END) no_od_cost_ship_method
+     , SUM(CASE WHEN fta.context_name = 'f2p_no_od_cost' THEN fta.quantity ELSE 0 END) no_od_cost_quantity
+--      , SUM(CASE WHEN fta.context_name = 'f2p_no_od_cost' THEN fta.distance*fta.quantity ELSE 0 END) no_od_cost_distance_w
+     , MAX(CASE WHEN fta.context_name = 'f2p_no_od_cost' THEN fta.distance ELSE NULL END) no_od_cost_distance
+--      , MIN(CASE WHEN fta.context_name = 'f2p_no_od_cost' THEN fta.units_per_shipment ELSE NULL END) no_od_cost_units_per_shipment
+
+
+       , SUM(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN 1 ELSE 0 END) direct_lane_item_assignments
+       , MAX(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.fc_name ELSE NULL END) direct_lane_fc_name
+       , MAX(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' AND Region_Rnk_Flag = 1 THEN fta.fc_region ELSE NULL END) direct_lane_fc_region
+       , MAX(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.supply_type ELSE NULL END) direct_lane_supply_type
+       , MAX(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.ship_method ELSE NULL END) direct_lane_ship_method
+       , MAX(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.is_remote_fulfilled ELSE NULL END) direct_lane_is_remote_fulfilled
+       , SUM(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.quantity ELSE 0 END) direct_lane_quantity
+       , SUM(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.ship_cpu + fta.picking_cpu + fta.packing_cpu + fta.transship_cpu ELSE 0 END) direct_lane_costs
+       , SUM(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.ship_cpu ELSE 0 END) direct_lane_ship_cpu
+       , SUM(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.ship_cpu ELSE 0 END) direct_lane_ship_cost
+       , SUM(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.picking_cpu ELSE 0 END) direct_lane_picking_cost
+       , SUM(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.packing_cpu ELSE 0 END) direct_lane_packing_cost
+       , SUM(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.transship_cpu ELSE 0 END) direct_lane_transship_cost
+       , SUM(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.atrops_penalty_cpu ELSE 0 END) direct_lane_atrops_penalty_cost
+       , SUM(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.opportunity_cpu ELSE 0 END) direct_lane_opp_cost
+       , SUM(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.inbound_cpu ELSE 0 END) direct_lane_inbound_cost
+       , SUM(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.sourcing_cpu ELSE 0 END) direct_lane_sourcing_cost
+       , SUM(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.lb_cpu_by_wt ELSE 0 END) direct_lane_lb_cost
+       , SUM(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.ramp_cost ELSE 0 END) direct_lane_ramp_cost
+       , SUM(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.shipment_penalty_cost ELSE 0 END) direct_lane_shipment_penalty_cost
+       , SUM(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.total_cost ELSE 0 END) direct_lane_total_cost
+       , SUM(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.distance * fta.quantity ELSE 0 END) direct_lane_distance_w
+       , MAX(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.distance ELSE NULL END) direct_lane_distance
+       , MAX(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.constraint_fasttrack ELSE NULL END) direct_lane_constraint_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.constraint_item_dims_ovrd_box ELSE NULL END) direct_lane_constraint_item_dims_ovrd_box
+       , MAX(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.constraint_last_chance ELSE NULL END) direct_lane_constraint_last_chance
+       , MAX(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.constraint_pdd ELSE NULL END) direct_lane_constraint_pdd
+       , MAX(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.constraint_psd ELSE NULL END) direct_lane_constraint_psd
+       , MAX(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.constraint_unknown_avail ELSE NULL END) direct_lane_constraint_unknown_avail
+       , MAX(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.constraint_pdd_fasttrack ELSE NULL END) direct_lane_constraint_pdd_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.constraint_pdd_non_fasttrack ELSE NULL END) direct_lane_constraint_pdd_non_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.constraint_pdd_unknown_promise ELSE NULL END) direct_lane_constraint_pdd_unknown_promise
+       , MAX(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.constraint_psd_fasttrack ELSE NULL END) direct_lane_constraint_psd_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.constraint_psd_non_fasttrack ELSE NULL END) direct_lane_constraint_psd_non_fasttrack
+       , MAX(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.constraint_psd_unknown_promise ELSE NULL END) direct_lane_constraint_psd_unknown_promise
+       , MAX(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.box_type END) direct_lane_box_type
+       , MAX(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.box_barcode END) direct_lane_box_barcode
+       , MAX(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.box_volume ELSE 0 END) direct_lane_box_volume
+       , MIN(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.demand_has_dist_data ELSE NULL END) direct_lane_has_dist_data
+       , MIN(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.demand_has_fc_data ELSE NULL END) direct_lane_has_fc_data
+       , MIN(CASE WHEN fta.context_name = 'css_prioritize_direct_lane_assignment' THEN fta.units_per_shipment ELSE NULL END) direct_lane_units_per_shipment
+       
+       
+FROM fta
+WHERE 1 = 1
+GROUP BY fta.region_id
+         , fta.creation_date
+         , fta.fulfillment_request_id
+         , fta.marketplace_timezone
+         , fta.marketplace_country_code
+         , fta.marketplace_name
+         , fta.planning_date
+         , fta.marketplace_id
+         , fta.legal_entity_id
+         , fta.address_id
+         , fta.order_id
+         , fta.customer_country
+        --  , fta.state
+         , fta.region
+         , fta.customer_zip
+         , fta.customer_zip5
+         , fta.Customer_region
+         , fta.order_date
+         , fta.is_item_ft
+         , fta.internal_pdd
+         , fta.fnsku
+         , fta.iaid
+         , fta.line_item_id
+         , fta.customer_order_item_id
+         , fta.gl_product_group
+         , fta.is_hazmat
+         , fta.is_nyp
+         , fta.sortability
+;
+
+
+CREATE TEMP TABLE supply AS
+-- supply archive scan and distribution
+SELECT /*+ BROADCAST(fc) */
+         s.fulfillment_request_archive_id
+       , s.CREATION_Date
+       , s.order_archive_id
+       , s.fnsku
+       , s.fc_name
+       , fc.fc_zip5
+       , s.fast_track
+       , CASE
+         WHEN fc.warehouse_id IS NULL THEN 0
+         ELSE 1
+       END supply_has_fc_data
+       , fc.legal_entity_id
+       , s.quantity
+       , fta.customer_zip5
+       , fta.customer_country
+       , fta.legal_entity_id customer_legal_entity_id
+FROM andes_ext.ORDER_ASSIGNMENT.supply_archive s
+-- inner join here, we'll do an outer join later
+  INNER JOIN (SELECT fta.order_archive_id
+             , fta.fnsku
+             , fta.customer_country
+             , fta.customer_zip5
+             , fta.legal_entity_id
+      FROM fta_core fta
+      WHERE context_name = 'f2p_production'
+      GROUP BY fta.order_archive_id
+               , fta.fnsku
+               , fta.customer_country
+               , fta.customer_zip5
+               , fta.legal_entity_id) fta
+    ON fta.order_archive_id = s.order_archive_id
+   AND fta.fnsku = s.fnsku
+  LEFT JOIN fc ON s.fc_name = fc.warehouse_id
+WHERE 1 = 1
+AND   s.region_id = 1
+and   s.marketplace_id=7
+AND   s.CREATION_Date >= to_date('{RUN_DATE_YYYY/MM/DD}', 'YYYY/MM/DD') - 1
+AND   s.CREATION_Date < to_date('{RUN_DATE_YYYY/MM/DD}', 'YYYY/MM/DD') -- MODIFIED HERE
+-- only for instock!
+AND   s.supply_type IN ('Prime','Reserve','Manufacturing','VirtualSupply')
+AND   s.context_name IN ('f2p_production')
+;
+
+CREATE TEMP TABLE supply_w_perc AS
+SELECT s.*
+       , zzd.distance
+       , PERCENTILE_CONT(0.05) WITHIN GROUP (ORDER BY zzd.distance) 
+         OVER (PARTITION BY s.order_archive_id, s.fnsku) AS instock_5thperc_distance
+       , PERCENTILE_CONT(0.10) WITHIN GROUP (ORDER BY zzd.distance)
+         OVER (PARTITION BY s.order_archive_id, s.fnsku) AS instock_10thperc_distance
+       , PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY zzd.distance)
+         OVER (PARTITION BY s.order_archive_id, s.fnsku) AS instock_25thperc_distance
+       , MIN(zzd.distance) OVER (PARTITION BY s.order_archive_id, s.fnsku) AS min_instock_distance
+       , MAX(zzd.distance) OVER (PARTITION BY s.order_archive_id, s.fnsku) AS max_instock_distance
+FROM supply s
+  LEFT JOIN fzd zzd
+         ON s.fc_name = zzd.warehouse_id
+        AND left(s.customer_zip5,3) = left(zzd.dest,3)
+        AND s.customer_country = zzd.dest_country_code
+WHERE 1 = 1;
+
+CREATE TEMP TABLE supply_denorm AS
+-- instock fcs
+SELECT
+         s.order_archive_id
+       , s.fnsku
+-- safety flags to ensure we get reliable data
+       , COUNT(DISTINCT (CASE WHEN distance IS NOT NULL THEN s.fc_name ELSE NULL END)) supply_has_dist_data_fc_count
+       , COUNT(DISTINCT (CASE WHEN s.supply_has_fc_data = 1 THEN s.fc_name ELSE NULL END)) supply_has_fc_data_fc_count
+-- total fcsinstock
+       , COUNT(DISTINCT (s.fc_name)) instock_fc_count
+       , SUM(s.quantity) instock_quantity
+-- ft fcsinstock
+       , COUNT(DISTINCT (CASE WHEN s.fast_track != 0 THEN s.fc_name ELSE NULL END)) instock_ft_fc_count
+       , SUM(CASE WHEN s.fast_track != 0 THEN s.quantity ELSE 0 END) instock_ft_quantity
+-- local fcsinstock
+       , COUNT(DISTINCT (CASE WHEN distance <= 1000 THEN s.fc_name ELSE NULL END)) instock_regional_fc_count
+       , SUM(CASE WHEN distance <= 1000 THEN s.quantity ELSE 0 END) instock_regional_quantity
+       , COUNT(DISTINCT (CASE WHEN distance <= 160 THEN s.fc_name ELSE NULL END)) instock_local_fc_count
+       , SUM(CASE WHEN distance <= 160 THEN s.quantity ELSE 0 END) instock_local_quantity
+       , COUNT(DISTINCT (CASE WHEN distance <= 100 THEN s.fc_name ELSE NULL END)) instock_sublocal_fc_count
+       , SUM(CASE WHEN distance <= 100 THEN s.quantity ELSE 0 END) instock_sublocal_quantity
+-- local ft fcsinstock
+       , COUNT(DISTINCT (CASE WHEN s.fast_track != 0 AND distance <= 1000 THEN s.fc_name ELSE NULL END)) instock_ft_regional_fc_count
+       , SUM(CASE WHEN s.fast_track != 0 AND distance <= 1000 THEN s.quantity ELSE 0 END) instock_ft_regional_quantity
+       , COUNT(DISTINCT (CASE WHEN s.fast_track != 0 AND distance <= 160 THEN s.fc_name ELSE NULL END)) instock_ft_local_fc_count
+       , SUM(CASE WHEN s.fast_track != 0 AND distance <= 160 THEN s.quantity ELSE 0 END) instock_ft_local_quantity
+       , COUNT(DISTINCT (CASE WHEN s.fast_track != 0 AND distance <= 100 THEN s.fc_name ELSE NULL END)) instock_ft_sublocal_fc_count
+       , SUM(CASE WHEN s.fast_track != 0 AND distance <= 100 THEN s.quantity ELSE 0 END) instock_ft_sublocal_quantity
+-- in-country fcsinstock
+       , COUNT(DISTINCT (CASE WHEN s.legal_entity_id = s.customer_legal_entity_id THEN s.fc_name ELSE NULL END)) instock_incountry_fc_count
+       , SUM(CASE WHEN s.legal_entity_id = s.customer_legal_entity_id THEN s.quantity ELSE 0 END) instock_incountry_quantity
+-- in-country ft fcsinstock
+       , COUNT(DISTINCT (CASE WHEN s.legal_entity_id = s.customer_legal_entity_id AND s.fast_track != 0 THEN s.fc_name ELSE NULL END)) instock_ft_incountry_fc_count
+       , SUM(CASE WHEN s.legal_entity_id = s.customer_legal_entity_id AND s.fast_track != 0 THEN s.quantity ELSE 0 END) instock_ft_incountry_quantity
+-- in-country local fcsinstock
+       , COUNT(DISTINCT (CASE WHEN s.legal_entity_id = s.customer_legal_entity_id AND distance <= 1000 THEN s.fc_name ELSE NULL END)) instock_incountry_regional_fc_count
+       , SUM(CASE WHEN s.legal_entity_id = s.customer_legal_entity_id AND distance <= 1000 THEN s.quantity ELSE 0 END) instock_incountry_regional_quantity
+       , COUNT(DISTINCT (CASE WHEN s.legal_entity_id = s.customer_legal_entity_id AND distance <= 160 THEN s.fc_name ELSE NULL END)) instock_incountry_local_fc_count
+       , SUM(CASE WHEN s.legal_entity_id = s.customer_legal_entity_id AND distance <= 160 THEN s.quantity ELSE 0 END) instock_incountry_local_quantity
+       , COUNT(DISTINCT (CASE WHEN s.legal_entity_id = s.customer_legal_entity_id AND distance <= 100 THEN s.fc_name ELSE NULL END)) instock_incountry_sublocal_fc_count
+       , SUM(CASE WHEN s.legal_entity_id = s.customer_legal_entity_id AND distance <= 100 THEN s.quantity ELSE 0 END) instock_incountry_sublocal_quantity
+-- in-country ft local fcsinstock
+       , COUNT(DISTINCT (CASE WHEN s.legal_entity_id = s.customer_legal_entity_id AND s.fast_track != 0 AND distance <= 1000 THEN s.fc_name ELSE NULL END)) instock_ft_incountry_regional_fc_count
+       , SUM(CASE WHEN s.legal_entity_id = s.customer_legal_entity_id AND s.fast_track != 0 AND distance <= 1000 THEN s.quantity ELSE 0 END) instock_ft_incountry_regional_quantity
+       , COUNT(DISTINCT (CASE WHEN s.legal_entity_id = s.customer_legal_entity_id AND s.fast_track != 0 AND distance <= 160 THEN s.fc_name ELSE NULL END)) instock_ft_incountry_local_fc_count
+       , SUM(CASE WHEN s.legal_entity_id = s.customer_legal_entity_id AND s.fast_track != 0 AND distance <= 160 THEN s.quantity ELSE 0 END) instock_ft_incountry_local_quantity
+       , COUNT(DISTINCT (CASE WHEN s.legal_entity_id = s.customer_legal_entity_id AND s.fast_track != 0 AND distance <= 100 THEN s.fc_name ELSE NULL END)) instock_ft_incountry_sublocal_fc_count
+       , SUM(CASE WHEN s.legal_entity_id = s.customer_legal_entity_id AND s.fast_track != 0 AND distance <= 100 THEN s.quantity ELSE 0 END) instock_ft_incountry_sublocal_quantity
+
+       , MIN(instock_5thperc_distance) instock_5thperc_distance
+       , COUNT(DISTINCT (CASE WHEN s.legal_entity_id = s.customer_legal_entity_id AND s.fast_track != 0 AND distance <= instock_5thperc_distance THEN s.fc_name ELSE NULL END)) instock_ft_5thperc_fc_count
+       , SUM(CASE WHEN s.legal_entity_id = s.customer_legal_entity_id AND s.fast_track != 0 AND distance <= instock_5thperc_distance THEN s.quantity ELSE 0 END) instock_ft_5thperc_quantity
+
+       , MIN(instock_10thperc_distance) instock_10thperc_distance
+       , COUNT(DISTINCT (CASE WHEN s.legal_entity_id = s.customer_legal_entity_id AND s.fast_track != 0 AND distance <= instock_10thperc_distance THEN s.fc_name ELSE NULL END)) instock_ft_10thperc_fc_count
+       , SUM(CASE WHEN s.legal_entity_id = s.customer_legal_entity_id AND s.fast_track != 0 AND distance <= instock_10thperc_distance THEN s.quantity ELSE 0 END) instock_ft_10thperc_quantity
+
+       , MIN(instock_25thperc_distance) instock_25thperc_distance
+       , COUNT(DISTINCT (CASE WHEN s.legal_entity_id = s.customer_legal_entity_id AND s.fast_track != 0 AND distance <= instock_25thperc_distance THEN s.fc_name ELSE NULL END)) instock_ft_25thperc_fc_count
+       , SUM(CASE WHEN s.legal_entity_id = s.customer_legal_entity_id AND s.fast_track != 0 AND distance <= instock_25thperc_distance THEN s.quantity ELSE 0 END) instock_ft_25thperc_quantity
+
+       , MIN(min_instock_distance) min_instock_distance
+       , MIN(max_instock_distance) max_instock_distance
+
+FROM supply_w_perc s
+WHERE 1 = 1
+-- AND IS_SSD_COVERED_ZIP = 'Y' --this will only retain SSD supply types where the SSD site was a legitimate supply type
+GROUP BY s.order_archive_id
+         , s.fnsku
+;
+
+CREATE TEMP TABLE result AS
+SELECT Cast(fta.region_id as Integer) as region_id
+     , CAST(TO_CHAR(fta.creation_date, 'YYYY-MM-DD HH24:MI:SS') AS TIMESTAMP) AS creation_date
+     , fta.fulfillment_request_id
+     , fta.marketplace_timezone
+     , fta.marketplace_country_code
+     , fta.marketplace_name
+     , fta.planning_date AS planning_date --we should take milliseconds here as well as it comes handy in creating the url
+     , CAST(fta.marketplace_id as decimal(38,0)) AS marketplace_id
+     , fta.legal_entity_id
+     , fta.address_id
+     , fta.order_id
+     , fta.ship_option
+     , fta.customer_country AS country
+     , fta.customer_zip
+    --  , fta.state
+     , fta.region
+     --, CAST(DATE_FORMAT(fta.order_date, 'yyyy-MM-dd HH:mm:ss') AS TIMESTAMP) AS order_date
+     , fta.is_item_ft
+     , CAST(TO_CHAR(fta.order_date, 'YYYY-MM-DD HH24:MI:SS') AS TIMESTAMP) AS order_date
+     , CAST(TO_CHAR(fta.internal_pdd, 'YYYY-MM-DD HH24:MI:SS') AS TIMESTAMP) AS internal_pdd
+     --, CAST(DATE_FORMAT(fta.internal_pdd, 'yyyy-MM-dd HH:mm:ss') AS TIMESTAMP) AS internal_pdd
+     , fta.fnsku
+     , fta.iaid
+     , fta.line_item_id
+     , fta.customer_order_item_id
+     , fta.gl_product_group
+     , fta.is_hazmat
+     , fta.is_fba
+     , fta.is_nyp
+     , fta.sortability
+     , CAST(fta.count_sims as decimal(38,0)) AS count_sims
+     , CAST(fta.count_sims_with_dist_data as decimal(38,0)) AS count_sims_with_dist_data
+     , CAST(fta.count_sims_with_fc_data as decimal(38,0)) AS count_sims_with_fc_data
+     , CAST(fta.fulfillment_request_archive_id as decimal(22,0)) AS prod_fulfillment_request_archive_id
+     , CAST(fta.prod_Item_assignments as decimal(38,0)) AS prod_Item_assignments
+     , fta.prod_fc_name
+     , fta.prod_supply_type
+     , fta.prod_ship_method
+     , fta.prod_is_remote_fulfilled
+     , fta.prod_quantity
+     , CAST(fta.prod_costs AS DECIMAL(38,10)) AS prod_costs
+     , CAST(fta.prod_ship_cpu AS DECIMAL(38,10)) AS prod_ship_cpu
+     , CAST(fta.prod_ship_cost AS DECIMAL(38,10)) AS prod_ship_cost
+     , CAST(fta.prod_picking_cost AS DECIMAL(38,10)) AS prod_picking_cost
+     , CAST(fta.prod_packing_cost AS DECIMAL(38,10)) AS prod_packing_cost
+     , CAST(fta.prod_transship_cost AS DECIMAL(38,10)) AS prod_transship_cost
+     , CAST(fta.prod_atrops_penalty_cost AS DECIMAL(38,10)) AS prod_atrops_penalty_cost
+     , CAST(fta.prod_opp_cost AS DECIMAL(38,10)) AS prod_opp_cost
+     , CAST(fta.prod_inbound_cost AS DECIMAL(38,10)) AS prod_inbound_cost
+     , CAST(fta.prod_sourcing_cost AS DECIMAL(38,10)) AS prod_sourcing_cost
+     , CAST(fta.prod_lb_cost AS DECIMAL(38,10)) AS prod_lb_cost
+     , CAST(fta.prod_ramp_cost AS DECIMAL(38,10)) AS prod_ramp_cost
+     , CAST(fta.prod_shipment_penalty_cost AS DECIMAL(38,10)) AS prod_shipment_penalty_cost
+     , CAST(fta.prod_total_cost AS DECIMAL(38,10)) AS prod_total_cost
+     , fta.prod_constraint_fasttrack
+     , fta.prod_constraint_item_dims_ovrd_box
+     , fta.prod_constraint_last_chance
+     , fta.prod_constraint_pdd
+     , fta.prod_constraint_psd
+     , fta.prod_constraint_unknown_avail
+     , fta.prod_constraint_pdd_fasttrack
+     , fta.prod_constraint_pdd_non_fasttrack
+     , CAST(fta.prod_constraint_pdd_unknown_promise as decimal(38,0)) AS prod_constraint_pdd_unknown_promise
+     , fta.prod_constraint_psd_fasttrack
+     , fta.prod_constraint_psd_non_fasttrack
+     , CAST(fta.prod_constraint_psd_unknown_promise as decimal(38,0)) AS prod_constraint_psd_unknown_promise
+     , fta.prod_box_type
+     , fta.prod_box_barcode
+     , CAST(fta.prod_box_volume  as decimal(38,10)) AS prod_box_volume
+     , fta.prod_distance_w
+     , CAST(fta.prod_distance as decimal(38,0)) as prod_distance
+     , fta.prod_has_dist_data
+     , fta.prod_has_fc_data
+     , fta.prod_units_per_shipment
+     , cast(fta.baseline_item_assignments as decimal(38,0)) as baseline_item_assignments
+     , fta.baseline_fc_name
+     , fta.baseline_supply_type
+     , fta.baseline_ship_method
+     , fta.baseline_is_remote_fulfilled
+     , fta.baseline_quantity
+     , CAST(fta.baseline_costs AS DECIMAL(38,10)) AS baseline_costs
+     , fta.baseline_distance_w
+     , cast(fta.baseline_distance as decimal(38,0)) AS baseline_distance
+     , fta.baseline_has_dist_data
+     , fta.baseline_has_fc_data
+     , fta.baseline_units_per_shipment
+     , CAST(fta.inf_inventory_item_assignments  AS DECIMAL(38,10)) AS inf_inventory_item_assignments
+     , fta.inf_inventory_fc_name
+     , fta.inf_inventory_supply_type
+     , fta.inf_inventory_ship_method
+     , fta.inf_inventory_is_remote_fulfilled
+     , fta.inf_inventory_quantity
+     , CAST(fta.inf_inventory_costs AS DECIMAL(38,10)) AS inf_inventory_costs
+     , fta.inf_inventory_distance_w
+     , CAST(fta.inf_inventory_distance  AS DECIMAL(38,0)) AS inf_inventory_distance
+     , fta.inf_inventory_has_dist_data
+     , fta.inf_inventory_has_fc_data
+     , fta.inf_inventory_units_per_shipment
+     , CAST(fta.unconstr_atrops_Item_assignments as decimal(38,0)) AS unconstr_atrops_Item_assignments
+     , fta.unconstr_atrops_fc_name
+     , fta.unconstr_atrops_supply_type
+     , fta.unconstr_atrops_ship_method
+     , fta.unconstr_atrops_is_remote_fulfilled
+     , fta.unconstr_atrops_quantity
+     , CAST(fta.unconstr_atrops_costs AS DECIMAL(38,10)) AS unconstr_atrops_costs
+     , fta.unconstr_atrops_distance_w
+     , fta.unconstr_atrops_distance
+     , fta.unconstr_atrops_has_dist_data
+     , fta.unconstr_atrops_has_fc_data
+     , fta.unconstr_atrops_units_per_shipment
+     , CAST(fta.line_item_grouped_Item_assignments as decimal(38,0)) AS line_item_grouped_Item_assignments
+     , fta.line_item_grouped_fc_name
+     , fta.line_item_grouped_supply_type
+     , fta.line_item_grouped_ship_method
+     , fta.line_item_grouped_is_remote_fulfilled
+     , fta.line_item_grouped_quantity
+     , CAST(fta.line_item_grouped_costs AS DECIMAL(38,10)) AS line_item_grouped_costs
+     , fta.line_item_grouped_distance_w
+     , fta.line_item_grouped_distance
+     , fta.line_item_grouped_has_dist_data
+     , fta.line_item_grouped_has_fc_data
+     , fta.line_item_grouped_units_per_shipment
+     , CAST(fta.no_spock_Item_assignments as decimal(38,0)) AS no_spock_Item_assignments
+     , fta.no_spock_fc_name
+     , fta.no_spock_supply_type
+     , fta.no_spock_ship_method
+     , fta.no_spock_is_remote_fulfilled
+     , fta.no_spock_quantity
+     , CAST(fta.no_spock_costs AS DECIMAL(38,10)) AS no_spock_costs 
+     , fta.no_spock_distance_w
+     , fta.no_spock_distance
+     , fta.no_spock_has_dist_data
+     , fta.no_spock_has_fc_data
+     , fta.no_spock_units_per_shipment
+     , CAST(fta.no_atrops_pen_cost_Item_assignments as decimal(38,0)) AS no_atrops_pen_cost_Item_assignments
+     , fta.no_atrops_pen_cost_fc_name
+     , fta.no_atrops_pen_cost_supply_type
+     , fta.no_atrops_pen_cost_ship_method
+     , fta.no_atrops_pen_cost_is_remote_fulfilled
+     , fta.no_atrops_pen_cost_quantity
+     , CAST(fta.no_atrops_pen_cost_costs AS DECIMAL(38,10)) AS no_atrops_pen_cost_costs
+     , fta.no_atrops_pen_cost_distance_w
+     , fta.no_atrops_pen_cost_distance
+     , fta.no_atrops_pen_cost_has_dist_data
+     , fta.no_atrops_pen_cost_has_fc_data
+     , fta.no_atrops_pen_cost_units_per_shipment
+     , CAST(fta.no_spock_no_caps_Item_assignments as decimal(38,0)) AS no_spock_no_caps_Item_assignments
+     , fta.no_spock_no_caps_fc_name
+     , fta.no_spock_no_caps_supply_type
+     , fta.no_spock_no_caps_ship_method
+     , fta.no_spock_no_caps_is_remote_fulfilled
+     , fta.no_spock_no_caps_quantity
+     , CAST(fta.no_spock_no_caps_costs AS DECIMAL(38,10)) AS no_spock_no_caps_costs
+     , fta.no_spock_no_caps_distance_w
+     , fta.no_spock_no_caps_distance
+     , fta.no_spock_no_caps_has_dist_data
+     , fta.no_spock_no_caps_has_fc_data
+     , fta.no_spock_no_caps_units_per_shipment
+     , CAST(fta.no_inbound_cost_Item_assignments as decimal(38,0)) AS no_inbound_cost_Item_assignments
+     , fta.no_inbound_cost_fc_name
+     , fta.no_inbound_cost_supply_type
+     , fta.no_inbound_cost_ship_method
+     , fta.no_inbound_cost_is_remote_fulfilled
+     , fta.no_inbound_cost_quantity
+     , CAST(fta.no_inbound_cost_costs AS DECIMAL(38,10)) AS no_inbound_cost_costs
+     , fta.no_inbound_cost_distance_w
+     , fta.no_inbound_cost_distance
+     , fta.no_inbound_cost_has_dist_data
+     , fta.no_inbound_cost_has_fc_data
+     , fta.no_inbound_cost_units_per_shipment
+     , CAST(fta.no_inbound_no_item_cost_Item_assignments as decimal(38,0)) AS no_inbound_no_item_cost_Item_assignments
+     , fta.no_inbound_no_item_cost_fc_name
+     , fta.no_inbound_no_item_cost_supply_type
+     , fta.no_inbound_no_item_cost_ship_method
+     , fta.no_inbound_no_item_cost_is_remote_fulfilled
+     , fta.no_inbound_no_item_cost_quantity
+     , CAST(fta.no_inbound_no_item_cost_costs AS DECIMAL(38,10)) AS no_inbound_no_item_cost_costs
+     , fta.no_inbound_no_item_cost_distance_w
+     , fta.no_inbound_no_item_cost_distance
+     , fta.no_inbound_no_item_cost_has_dist_data
+     , fta.no_inbound_no_item_cost_has_fc_data
+     , fta.no_inbound_no_item_cost_units_per_shipment
+     , CAST(fta.wregion_supply_Item_assignments as decimal(38,0)) AS wregion_supply_Item_assignments
+     , fta.wregion_supply_fc_name
+     , fta.wregion_supply_supply_type
+     , fta.wregion_supply_ship_method
+     , fta.wregion_supply_is_remote_fulfilled
+     , fta.wregion_supply_quantity
+     , CAST(fta.wregion_supply_costs AS DECIMAL(38,10)) AS wregion_supply_costs
+     , CAST(fta.wregion_supply_ship_cpu AS DECIMAL(38,10)) AS wregion_supply_ship_cpu
+     , CAST(fta.wregion_supply_ship_cost AS DECIMAL(38,10)) AS wregion_supply_ship_cost
+     , CAST(fta.wregion_supply_picking_cost AS DECIMAL(38,10)) AS wregion_supply_picking_cost
+     , CAST(fta.wregion_supply_packing_cost AS DECIMAL(38,10)) AS wregion_supply_packing_cost
+     , CAST(fta.wregion_supply_transship_cost AS DECIMAL(38,10)) AS wregion_supply_transship_cost
+     , CAST(fta.wregion_supply_atrops_penalty_cost AS DECIMAL(38,10)) AS wregion_supply_atrops_penalty_cost
+     , CAST(fta.wregion_supply_opp_cost AS DECIMAL(38,10)) AS wregion_supply_opp_cost
+     , CAST(fta.wregion_supply_inbound_cost AS DECIMAL(38,10)) AS wregion_supply_inbound_cost
+     , CAST(fta.wregion_supply_sourcing_cost AS DECIMAL(38,10)) AS wregion_supply_sourcing_cost
+     , CAST(fta.wregion_supply_lb_cost AS DECIMAL(38,10)) AS wregion_supply_lb_cost
+     , CAST(fta.wregion_supply_ramp_cost AS DECIMAL(38,10)) AS wregion_supply_ramp_cost
+     , CAST(fta.wregion_supply_shipment_penalty_cost AS DECIMAL(38,10)) AS wregion_supply_shipment_penalty_cost
+     , CAST(fta.wregion_supply_total_cost AS DECIMAL(38,10)) AS wregion_supply_total_cost
+     , CAST(fta.wregion_supply_constraint_Fasttrack as decimal(38,0)) AS wregion_supply_constraint_Fasttrack
+     , fta.wregion_supply_constraint_item_dims_ovrd_box
+     , fta.wregion_supply_constraint_last_chance
+     , fta.wregion_supply_constraint_pdd
+     , fta.wregion_supply_constraint_psd
+     , fta.wregion_supply_constraint_unknown_avail
+     , CAST(fta.wregion_supply_constraint_pdd_Fasttrack as decimal(38,0)) AS wregion_supply_constraint_pdd_Fasttrack
+     , CAST(fta.wregion_supply_constraint_pdd_non_Fasttrack as decimal(38,0)) AS wregion_supply_constraint_pdd_non_Fasttrack
+     , CAST(fta.wregion_supply_constraint_pdd_unknown_promise as decimal(38,0)) AS wregion_supply_constraint_pdd_unknown_promise
+     , CAST(fta.wregion_supply_constraint_psd_Fasttrack as decimal(38,0)) AS wregion_supply_constraint_psd_Fasttrack
+     , CAST(fta.wregion_supply_constraint_psd_non_Fasttrack as decimal(38,0)) AS wregion_supply_constraint_psd_non_Fasttrack
+     , CAST(fta.wregion_supply_constraint_psd_unknown_promise as decimal(38,0)) AS wregion_supply_constraint_psd_unknown_promise
+     , fta.wregion_supply_box_type
+     , fta.wregion_supply_box_barcode
+     , CAST(fta.wregion_supply_box_volume as decimal(38,10)) AS wregion_supply_box_volume
+     , fta.wregion_supply_distance_w
+     , fta.wregion_supply_distance
+     , fta.wregion_supply_has_dist_data
+     , fta.wregion_supply_has_fc_data
+     , fta.wregion_supply_units_per_shipment
+     , CAST(s.instock_fc_count  AS DECIMAL(38,0)) AS instock_fc_count
+     , s.instock_quantity
+     , CAST(s.instock_ft_FC_Count AS DECIMAL(38,0)) AS instock_ft_FC_Count
+     , s.instock_ft_quantity
+     , CAST(s.instock_regional_FC_Count AS DECIMAL(38,0)) AS instock_regional_FC_Count
+     , s.instock_regional_quantity
+     , CAST(s.instock_local_FC_Count AS DECIMAL(38,0)) AS instock_local_FC_Count
+     , s.instock_local_quantity
+     , CAST(s.instock_sublocal_FC_Count AS DECIMAL(38,0)) AS instock_sublocal_FC_Count
+     , s.instock_sublocal_quantity
+     , CAST(s.instock_ft_regional_FC_Count AS DECIMAL(38,0)) AS instock_ft_regional_FC_Count
+     , s.instock_ft_regional_quantity
+     , CAST(s.instock_ft_local_FC_Count AS DECIMAL(38,0)) AS instock_ft_local_FC_Count
+     , s.instock_ft_local_quantity
+     , CAST(s.instock_ft_sublocal_FC_Count AS DECIMAL(38,0)) AS instock_ft_sublocal_FC_Count
+     , s.instock_ft_sublocal_quantity
+     , CAST(s.instock_incountry_FC_Count AS DECIMAL(38,0)) AS instock_incountry_FC_Count
+     , s.instock_incountry_quantity
+     , CAST(s.instock_ft_incountry_FC_Count AS DECIMAL(38,0)) AS instock_ft_incountry_FC_Count
+     , s.instock_ft_incountry_quantity
+     , CAST(s.instock_incountry_regional_FC_Count AS DECIMAL(38,0)) AS instock_incountry_regional_FC_Count
+     , s.instock_incountry_regional_quantity
+     , CAST(s.instock_incountry_local_FC_Count AS DECIMAL(38,0)) AS instock_incountry_local_FC_Count
+     , s.instock_incountry_local_quantity
+     , CAST(s.instock_incountry_sublocal_FC_Count AS DECIMAL(38,0)) AS instock_incountry_sublocal_FC_Count
+     , s.instock_incountry_sublocal_quantity
+     , CAST(s.instock_ft_incountry_regional_FC_Count AS DECIMAL(38,0)) AS instock_ft_incountry_regional_FC_Count
+     , s.instock_ft_incountry_regional_quantity
+     , CAST(s.instock_ft_incountry_local_FC_Count AS DECIMAL(38,0)) AS instock_ft_incountry_local_FC_Count
+     , s.instock_ft_incountry_local_quantity
+     , CAST(s.instock_ft_incountry_sublocal_FC_Count AS DECIMAL(38,0)) AS instock_ft_incountry_sublocal_FC_Count
+     , s.instock_ft_incountry_sublocal_quantity
+     , CAST(s.supply_has_dist_data_FC_Count AS DECIMAL(38,0)) AS supply_has_dist_data_FC_Count
+     , CAST(s.supply_has_fc_data_FC_Count AS DECIMAL(38,0)) AS supply_has_fc_data_FC_Count
+     , s.instock_5thperc_distance
+     , CAST(s.instock_ft_5thperc_FC_Count AS DECIMAL(38,0)) AS instock_ft_5thperc_FC_Count
+     , s.instock_ft_5thperc_quantity
+     , s.instock_10thperc_distance
+     , CAST(s.instock_ft_10thperc_FC_Count AS DECIMAL(38,0)) AS instock_ft_10thperc_FC_Count
+     , s.instock_ft_10thperc_quantity
+     , s.instock_25thperc_distance
+     , CAST(s.instock_ft_25thperc_FC_Count AS DECIMAL(38,0)) AS instock_ft_25thperc_FC_Count
+     , s.instock_ft_25thperc_quantity
+     , s.min_instock_distance
+     , s.max_instock_distance
+     , CAST(fta.wlocal_supply_Item_assignments as decimal(38,0)) AS wlocal_supply_Item_assignments
+     , fta.wlocal_supply_fc_name
+     , fta.wlocal_supply_supply_type
+     , fta.wlocal_supply_ship_method
+     , fta.wlocal_supply_is_remote_fulfilled
+     , fta.wlocal_supply_quantity
+     , CAST(fta.wlocal_supply_costs AS DECIMAL(38,10)) AS wlocal_supply_costs
+     , CAST(fta.wlocal_supply_ship_cost AS DECIMAL(38,10)) AS wlocal_supply_ship_cost
+     , CAST(fta.wlocal_supply_picking_cost AS DECIMAL(38,10)) AS wlocal_supply_picking_cost
+     , CAST(fta.wlocal_supply_packing_cost AS DECIMAL(38,10)) AS wlocal_supply_packing_cost
+     , CAST(fta.wlocal_supply_transship_cost AS DECIMAL(38,10)) AS wlocal_supply_transship_cost
+     , CAST(fta.wlocal_supply_atrops_penalty_cost AS DECIMAL(38,10)) AS wlocal_supply_atrops_penalty_cost
+     , CAST(fta.wlocal_supply_opp_cost AS DECIMAL(38,10)) AS wlocal_supply_opp_cost
+     , CAST(fta.wlocal_supply_inbound_cost AS DECIMAL(38,10)) AS wlocal_supply_inbound_cost
+     , CAST(fta.wlocal_supply_sourcing_cost AS DECIMAL(38,10)) AS wlocal_supply_sourcing_cost
+     , CAST(fta.wlocal_supply_lb_cost AS DECIMAL(38,10)) AS wlocal_supply_lb_cost
+     , fta.wlocal_supply_box_type
+     , fta.wlocal_supply_box_barcode
+     , CAST(fta.wlocal_supply_box_volume as decimal(38,10)) AS wlocal_supply_box_volume
+     , fta.wlocal_supply_units_per_shipment
+     , fta.wlocal_supply_distance_w
+     , fta.wlocal_supply_distance
+     , fta.wlocal_supply_has_dist_data
+     , fta.wlocal_supply_has_fc_data
+     , CAST(fta.wlocal_supply_ramp_cost AS DECIMAL(38,10)) AS wlocal_supply_ramp_cost
+     , CAST(fta.wlocal_supply_shipment_penalty_cost AS DECIMAL(38,10)) AS wlocal_supply_shipment_penalty_cost
+     , CAST(fta.wlocal_supply_total_cost AS DECIMAL(38,10)) AS wlocal_supply_total_cost
+     , CAST(fta.wlocal_supply_constraint_Fasttrack as decimal(38,0)) AS wlocal_supply_constraint_Fasttrack
+     , fta.wlocal_supply_constraint_item_dims_ovrd_box
+     , fta.wlocal_supply_constraint_last_chance
+     , fta.wlocal_supply_constraint_pdd
+     , fta.wlocal_supply_constraint_psd
+     , fta.wlocal_supply_constraint_unknown_avail
+     , CAST(fta.wlocal_supply_constraint_pdd_Fasttrack as decimal(38,0)) AS wlocal_supply_constraint_pdd_Fasttrack
+     , CAST(fta.wlocal_supply_constraint_pdd_non_Fasttrack as decimal(38,0)) AS wlocal_supply_constraint_pdd_non_Fasttrack
+     , CAST(fta.wlocal_supply_constraint_pdd_unknown_promise as decimal(38,0)) AS wlocal_supply_constraint_pdd_unknown_promise
+     , CAST(fta.wlocal_supply_constraint_psd_Fasttrack as decimal(38,0)) AS wlocal_supply_constraint_psd_Fasttrack
+     , CAST(fta.wlocal_supply_constraint_psd_non_Fasttrack as decimal(38,0)) AS wlocal_supply_constraint_psd_non_Fasttrack
+     , CAST(fta.wlocal_supply_constraint_psd_unknown_promise as decimal(38,0)) AS wlocal_supply_constraint_psd_unknown_promise
+     , CAST(fta.hard_regionalization_item_assignments AS DECIMAL(38,0)) AS hard_regionalization_item_assignments
+     , fta.hard_regionalization_fc_name
+     , fta.hard_regionalization_supply_type
+     , fta.hard_regionalization_ship_method
+     , fta.hard_regionalization_is_remote_fulfilled
+     , fta.hard_regionalization_quantity
+     , CAST(fta.hard_regionalization_costs AS DECIMAL(38,10)) AS hard_regionalization_costs
+     , CAST(fta.hard_regionalization_ship_cpu AS DECIMAL(38,10)) AS hard_regionalization_ship_cpu
+     , CAST(fta.hard_regionalization_ship_cost AS DECIMAL(38,10)) AS hard_regionalization_ship_cost
+     , CAST(fta.hard_regionalization_picking_cost AS DECIMAL(38,10)) AS hard_regionalization_picking_cost
+     , CAST(fta.hard_regionalization_packing_cost AS DECIMAL(38,10)) AS hard_regionalization_packing_cost
+     , CAST(fta.hard_regionalization_transship_cost AS DECIMAL(38,10)) AS hard_regionalization_transship_cost
+     , CAST(fta.hard_regionalization_atrops_penalty_cost AS DECIMAL(38,10)) AS hard_regionalization_atrops_penalty_cost
+     , CAST(fta.hard_regionalization_opp_cost AS DECIMAL(38,10)) AS hard_regionalization_opp_cost
+     , CAST(fta.hard_regionalization_inbound_cost AS DECIMAL(38,10)) AS hard_regionalization_inbound_cost
+     , CAST(fta.hard_regionalization_sourcing_cost AS DECIMAL(38,10)) AS hard_regionalization_sourcing_cost
+     , CAST(fta.hard_regionalization_lb_cost AS DECIMAL(38,10)) AS hard_regionalization_lb_cost
+     , fta.hard_regionalization_box_type
+     , fta.hard_regionalization_box_barcode
+     , CAST(fta.hard_regionalization_box_volume  AS DECIMAL(38,10)) AS hard_regionalization_box_volume
+     , fta.hard_regionalization_units_per_shipment
+     , fta.hard_regionalization_distance_w
+     , CAST(fta.hard_regionalization_distance as decimal(38,0)) as hard_regionalization_distance
+     , fta.hard_regionalization_has_dist_data
+     , fta.hard_regionalization_has_fc_data
+     , CAST(fta.hard_regionalization_ramp_cost AS DECIMAL(38,10)) AS hard_regionalization_ramp_cost
+     , CAST(fta.hard_regionalization_shipment_penalty_cost AS DECIMAL(38,10)) AS hard_regionalization_shipment_penalty_cost
+     , CAST(fta.hard_regionalization_total_cost AS DECIMAL(38,10)) AS hard_regionalization_total_cost
+     , CAST(fta.hard_regionalization_constraint_Fasttrack as decimal(38,0)) AS hard_regionalization_constraint_Fasttrack
+     , fta.hard_regionalization_constraint_item_dims_ovrd_box
+     , fta.hard_regionalization_constraint_last_chance
+     , fta.hard_regionalization_constraint_pdd
+     , fta.hard_regionalization_constraint_psd
+     , fta.hard_regionalization_constraint_unknown_avail
+     , CAST(fta.hard_regionalization_constraint_pdd_fasttrack as decimal(38,0)) as hard_regionalization_constraint_pdd_fasttrack
+     , CAST(fta.hard_regionalization_constraint_pdd_non_fasttrack  as decimal(38,0)) as hard_regionalization_constraint_pdd_non_fasttrack
+     , CAST(fta.hard_regionalization_constraint_pdd_unknown_promise  as decimal(38,0)) as hard_regionalization_constraint_pdd_unknown_promise
+     , CAST(fta.hard_regionalization_constraint_psd_fasttrack as decimal(38,0)) as hard_regionalization_constraint_psd_fasttrack
+     , CAST(fta.hard_regionalization_constraint_psd_non_fasttrack as decimal(38,0)) as hard_regionalization_constraint_psd_non_fasttrack
+     , CAST(fta.hard_regionalization_constraint_psd_unknown_promise as decimal(38,0)) as hard_regionalization_constraint_psd_unknown_promise
+     , fta.prod_fc_region
+     , fta.baseline_fc_region
+     , fta.inf_inventory_fc_region
+     , fta.unconstr_atrops_fc_region
+     , fta.line_item_grouped_fc_region
+     , fta.no_spock_fc_region
+     , fta.no_atrops_pen_cost_fc_region
+     , fta.no_spock_no_caps_fc_region
+     , fta.no_inbound_cost_fc_region
+     , fta.no_inbound_no_item_cost_fc_region
+     , fta.wregion_supply_fc_region
+     , fta.wlocal_supply_fc_region
+     , fta.hard_regionalization_fc_region
+     , fta.Customer_region
+     ,  CAST(no_fc_limit_cost_distance as decimal(38,0)) as no_fc_limit_cost_distance
+     ,  no_fc_limit_cost_fc_name
+     ,  no_fc_limit_cost_fc_region
+     ,  no_fc_limit_cost_quantity
+     ,  CAST(no_od_cost_distance as decimal(38,0)) as no_od_cost_distance
+     ,  no_od_cost_fc_name
+     ,  no_od_cost_fc_region
+     ,  no_od_cost_quantity
+     ,  CAST(no_offset_cost_distance as decimal(38,0)) as no_offset_cost_distance
+     ,  no_offset_cost_fc_name
+     ,  no_offset_cost_fc_region
+     ,  no_offset_cost_quantity
+     ,  CAST(no_risk_cost_distance as decimal(38,0)) as no_risk_cost_distance
+     ,  no_risk_cost_fc_name
+     ,  no_risk_cost_fc_region
+     ,  no_risk_cost_quantity
+     ,  CAST(no_target_cost_distance as decimal(38,0)) as no_target_cost_distance
+     ,  no_target_cost_fc_name
+     ,  no_target_cost_fc_region
+     ,  no_target_cost_quantity
+     ,  CAST(no_transship_cost_distance as decimal(38,0)) as no_transship_cost_distance
+     ,  no_transship_cost_fc_name
+     ,  no_transship_cost_fc_region
+     ,  no_transship_cost_quantity
+     ,  planned_Shipment_Id
+     ,  fta.order_archive_id
+     , CAST(fta.direct_lane_item_assignments AS DECIMAL(38,0)) AS direct_lane_item_assignments
+     , fta.direct_lane_fc_name
+     , fta.direct_lane_supply_type
+     , fta.direct_lane_ship_method
+     , fta.direct_lane_is_remote_fulfilled
+     , fta.direct_lane_quantity
+     , CAST(fta.direct_lane_costs AS DECIMAL(38,10)) AS direct_lane_costs
+     , CAST(fta.direct_lane_ship_cpu AS DECIMAL(38,10)) AS direct_lane_ship_cpu
+     , CAST(fta.direct_lane_ship_cost AS DECIMAL(38,10)) AS direct_lane_ship_cost
+     , CAST(fta.direct_lane_picking_cost AS DECIMAL(38,10)) AS direct_lane_picking_cost
+     , CAST(fta.direct_lane_packing_cost AS DECIMAL(38,10)) AS direct_lane_packing_cost
+     , CAST(fta.direct_lane_transship_cost AS DECIMAL(38,10)) AS direct_lane_transship_cost
+     , CAST(fta.direct_lane_atrops_penalty_cost AS DECIMAL(38,10)) AS direct_lane_atrops_penalty_cost
+     , CAST(fta.direct_lane_opp_cost AS DECIMAL(38,10)) AS direct_lane_opp_cost
+     , CAST(fta.direct_lane_inbound_cost AS DECIMAL(38,10)) AS direct_lane_inbound_cost
+     , CAST(fta.direct_lane_sourcing_cost AS DECIMAL(38,10)) AS direct_lane_sourcing_cost
+     , CAST(fta.direct_lane_lb_cost AS DECIMAL(38,10)) AS direct_lane_lb_cost
+     , fta.direct_lane_box_type
+     , fta.direct_lane_box_barcode
+     , CAST(fta.direct_lane_box_volume  AS DECIMAL(38,10)) AS direct_lane_box_volume
+     , fta.direct_lane_units_per_shipment
+     , fta.direct_lane_distance_w
+     , CAST(fta.direct_lane_distance as decimal(38,0)) as direct_lane_distance
+     , fta.direct_lane_has_dist_data
+     , fta.direct_lane_has_fc_data
+     , CAST(fta.direct_lane_ramp_cost AS DECIMAL(38,10)) AS direct_lane_ramp_cost
+     , CAST(fta.direct_lane_shipment_penalty_cost AS DECIMAL(38,10)) AS direct_lane_shipment_penalty_cost
+     , CAST(fta.direct_lane_total_cost AS DECIMAL(38,10)) AS direct_lane_total_cost
+     , CAST(fta.direct_lane_constraint_Fasttrack as decimal(38,0)) AS direct_lane_constraint_Fasttrack
+     , fta.direct_lane_constraint_item_dims_ovrd_box
+     , fta.direct_lane_constraint_last_chance
+     , fta.direct_lane_constraint_pdd
+     , fta.direct_lane_constraint_psd
+     , fta.direct_lane_constraint_unknown_avail
+     , CAST(fta.direct_lane_constraint_pdd_fasttrack as decimal(38,0)) as direct_lane_constraint_pdd_fasttrack
+     , CAST(fta.direct_lane_constraint_pdd_non_fasttrack  as decimal(38,0)) as direct_lane_constraint_pdd_non_fasttrack
+     , CAST(fta.direct_lane_constraint_pdd_unknown_promise  as decimal(38,0)) as direct_lane_constraint_pdd_unknown_promise
+     , CAST(fta.direct_lane_constraint_psd_fasttrack as decimal(38,0)) as direct_lane_constraint_psd_fasttrack
+     , CAST(fta.direct_lane_constraint_psd_non_fasttrack as decimal(38,0)) as direct_lane_constraint_psd_non_fasttrack
+     , CAST(fta.direct_lane_constraint_psd_unknown_promise as decimal(38,0)) as direct_lane_constraint_psd_unknown_promise
+     , direct_lane_fc_region
+
+FROM fta_denorm fta
+         LEFT JOIN supply_denorm s ON fta.order_archive_id = s.order_archive_id AND fta.fnsku = s.fnsku
+WHERE 1 = 1
+;
+
+SELECT *
+FROM result;
