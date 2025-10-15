@@ -1,0 +1,199 @@
+/*+ETLM {
+    depend:{
+        replace:[
+            {name:"andes.aftbi_ddl.d_transfer_request_items"}
+        ]
+    }
+}*/
+
+drop table if exists dtri_temp;
+create TEMP table dtri_temp 
+DISTSTYLE KEY 
+DISTKEY(order_id)
+SORTKEY(order_id, asin, inventory_owner_group_id)  
+AS
+select
+    transfer_creation_datetime,
+    split_part(DTRI.transfer_request_id,':',1) as order_id,
+    split_part(DTRI.transfer_request_id,':',2) as planning_time,
+    TIMESTAMP 'epoch' + cast(planning_time as bigint)/1000 * INTERVAL '1 Second ' as request_time,
+    asin,
+    inventory_owner_group_id,
+    source_warehouse_id,
+    destination_warehouse_id,
+    sum(QUANTITY_REQUESTED) - SUM(CASE WHEN DTRI.cancel_reason not in ('MANUAL','NOT_PICKED_BEFORE_EXSD') THEN quantity_cancelled ELSE 0 END) as requested_quantity
+from andes.aftbi_ddl.d_transfer_request_items DTRI
+where region_id = 1 
+    AND transfer_creation_datetime >= DATEADD(WEEK, -5, date '{RUN_DATE_YYYYMMDD}')
+    AND transfer_creation_datetime <= date '{RUN_DATE_YYYYMMDD}'
+    AND DTRI.TRANSFER_REQUEST_ID LIKE '%:%'
+    AND (source_warehouse_id like 'Y%' or source_warehouse_id in ('XCAB','XCAC'))
+    AND (destination_warehouse_id like 'Y%' or destination_warehouse_id in ('XCAB','XCAC'))
+    AND DTRI.cancel_reason IS NULL
+    AND DTRI.quantity_requested > 0
+    AND UPPER(DTRI.REQUESTER_TYPE) NOT IN ('PENDING', 'PENDING_CROSSDOCK', 'PENDING_MULTIHOP', 'FC-MULTIHOP')
+group by 1,2,3,4,5,6,7,8;
+
+drop table if exists temp_reactive_items_all_plans;
+create TEMP table temp_reactive_items_all_plans 
+DISTSTYLE KEY 
+DISTKEY(order_id)
+SORTKEY(order_id, planning_date, iaid, iog)  
+AS
+select 
+    fulfillment_request_id,
+    fulfillment_request_archive_id,
+    order_archive_id,
+    LINE_ITEM_ID,
+    planning_date,
+    transship_from,
+    FC_name,
+    order_id,
+    fnsku,
+    iaid,
+    iog,
+    is_fulfillment_fta,
+    redecide_reason,
+    quantity,
+    number_of_line_items,
+    no_of_assignments,
+    UNITS_PER_PLAN,
+    lead(planning_date) over (partition by fulfillment_request_id, LINE_ITEM_ID, order_id, iaid, iog order by planning_date asc) as lead_plan_time
+from (
+    select 
+        d.fulfillment_request_id,
+        d.fulfillment_request_archive_id,
+        d.order_archive_id,
+        d.planning_date,
+        nvl(d.transship_from, 'zzzz') as transship_from,
+        d.FC_name,
+        d.order_id,
+        d.iaid,
+        d.iog,
+        d.IS_FULFILLMENT_FTA as is_fulfillment_fta,
+        max(d.LINE_ITEM_ID) as LINE_ITEM_ID,
+        max(d.redecide_reason) as redecide_reason,
+        max(d.fnsku) as fnsku,
+        sum(d.quantity) as quantity,
+        count(distinct LINE_ITEM_ID) as number_of_line_items,
+        count(*) as no_of_assignments,
+        max(UNITS_PER_PLAN) as UNITS_PER_PLAN
+    from "andes"."order_assignment"."denormalized_archive_123d" d 
+    where region_id = 1
+        and context_name = 'f2p_production'
+        AND CREATION_DATE >= DATEADD(WEEK, -5, date '{RUN_DATE_YYYYMMDD}')
+        AND CREATION_DATE <= date '{RUN_DATE_YYYYMMDD}'
+        and transship_from is not null
+        and lower(supply_type) in ('prime', 'reserve')
+    group by 1,2,3,4,5,6,7,8,9,10
+);
+
+drop table if exists temp_dtri_f2p_plans;
+create TEMP table temp_dtri_f2p_plans 
+DISTSTYLE KEY 
+DISTKEY(fulfillment_request_id)
+SORTKEY(fulfillment_request_id, planning_date)  
+AS 
+select distinct
+    fulfillment_request_id,
+    planning_date
+from dtri_temp dtri
+join temp_reactive_items_all_plans f2p
+    on f2p.order_id = dtri.order_id
+    and (f2p.iaid = dtri.asin or f2p.fnsku = dtri.asin)
+    and f2p.iog = dtri.inventory_owner_group_id
+    and f2p.transship_from = dtri.source_warehouse_id
+    and f2p.fc_name = dtri.destination_warehouse_id
+    and dtri.request_time between f2p.planning_date and nvl(f2p.lead_plan_time,'3500-01-01');
+
+drop table if exists da;
+create temp table da 
+DISTSTYLE KEY 
+DISTKEY(fulfillment_request_id)
+SORTKEY(planning_date, fulfillment_request_id, shipment_archive_id)
+AS
+select
+    da1.marketplace_id,
+    da1.planning_date,
+    da1.fulfillment_request_id,
+    da1.shipment_archive_id,
+    da1.context_name,
+    da1.fnsku,
+    da1.iaid,
+    da1.transship_from,
+    da1.quantity,
+    da1.quantity_transshipped,
+    da1.boxes_per_plan as plan_tt_boxes,
+    da1.units_per_plan as plan_tt_units,
+    da1.units_per_shipment,
+    sum(case when da1.supply_type in ('Reserve','Prime') and da1.transship_from is not null then 1 else 0 end) 
+        over (partition by da1.fulfillment_request_id, da1.planning_date, da1.shipment_archive_id) as transfer_source_cnt,
+    sum(case when da1.transship_from is not null and da1.supply_type in ('Prime','Reserve') then da1.quantity else 0 end) 
+        over (partition by da1.fulfillment_request_id, da1.planning_date, da1.shipment_archive_id) as quantity_ts_shipment,
+    sum(da1.quantity) over (partition by da1.fulfillment_request_id, da1.planning_date, da1.shipment_archive_id) as quantity_shipment,
+    (da1.plan_ship_cost + da1.plan_pack_cost + da1.plan_pick_cost + da1.plan_giftwrap_cost + 
+     da1.plan_inbound_cost + da1.plan_sourcing_cost + da1.plan_transship_cost + 
+     (da1.plan_atrops_cost-1000.0*round(da1.plan_atrops_cost/1000.00)) + 
+     da1.plan_opportunity_cost + (da1.plan_lb_cost-100.0*round(da1.plan_lb_cost/100.00))
+    ) as plan_tt_cost,
+    (da1.plan_ship_cost + da1.plan_pack_cost + da1.plan_pick_cost + da1.plan_giftwrap_cost + 
+     da1.plan_inbound_cost + da1.plan_sourcing_cost + da1.plan_transship_cost
+    ) as plan_tt_cost_monetary
+from "andes"."order_assignment"."denormalized_archive_123d" da1
+join temp_dtri_f2p_plans rt
+    on da1.fulfillment_request_id = rt.fulfillment_request_id 
+    and da1.planning_date = rt.planning_date
+where da1.region_id = 1
+    and da1.marketplace_id = 7
+    AND da1.CREATION_DATE >= DATEADD(WEEK, -5, date '{RUN_DATE_YYYYMMDD}')
+    AND da1.CREATION_DATE <= date '{RUN_DATE_YYYYMMDD}'
+    AND da1.context_name in ('f2p_production', 'f2p_no_transships')
+    AND da1.fulfillment_request_id IS NOT NULL
+    AND da1.fc_name IS NOT NULL
+    AND da1.order_id IS NOT NULL
+    AND da1.fnsku IS NOT NULL;
+
+drop table if exists plans_scp;
+create temp table plans_scp 
+DISTSTYLE KEY 
+DISTKEY(fulfillment_request_id)
+SORTKEY(planning_week, planning_day, marketplace_id)
+as
+select
+    marketplace_id,
+    TRUNC(DATE_TRUNC('WEEK', TRUNC(planning_date)+1)-1) as planning_week,
+    TRUNC(planning_date) as planning_day,
+    fulfillment_request_id,
+    iaid,
+    fnsku,
+    max(case when context_name='f2p_production' then
+        case
+         when transfer_source_cnt = 1 and quantity_ts_shipment = quantity_shipment then 'single-source-WST'
+         when transfer_source_cnt > 1 and quantity_ts_shipment = quantity_shipment then 'multi-source-WST'
+        else 'non-WST' end
+    else null end) as WST_flag,
+    max(case when context_name='f2p_production' then plan_tt_boxes else 0 end) as plan_tt_boxes_prod,
+    max(case when context_name!='f2p_production' then plan_tt_boxes else 0 end) as plan_tt_boxes_sim,
+    sum(case when context_name='f2p_production' then quantity else 0 end) as quantity_prod,
+    sum(case when context_name!='f2p_production' then quantity else 0 end) as quantity_sim,
+    sum(case when context_name='f2p_production' then nvl(quantity_transshipped,0) else 0 end) as quantity_transshipped_prod,
+    sum(case when context_name!='f2p_production' then nvl(quantity_transshipped,0) else 0 end) as quantity_transshipped_sim
+from da
+group by 1,2,3,4,5,6
+having quantity_prod = quantity_sim
+    and quantity_transshipped_prod > 0;
+
+select
+    planning_week,
+    planning_day,
+    sum(case when quantity_transshipped_sim = 0 AND (plan_tt_boxes_sim - plan_tt_boxes_prod) <= 0 
+        then quantity_transshipped_prod else null end) AS non_splilt_savers_transships,
+    sum(case when quantity_transshipped_sim = 0 AND (plan_tt_boxes_sim - plan_tt_boxes_prod) >= 1 
+        then quantity_transshipped_prod else null end) AS splilt_savers_transships,
+    sum(case when quantity_transshipped_sim > 0 
+        then quantity_transshipped_prod else null end) AS must_do_transships,
+    sum(quantity_transshipped_prod) as quantity_transshipped_prod
+from plans_scp
+where marketplace_id = 7
+group by 1,2
+order by 1,2;
